@@ -1,7 +1,7 @@
 # WSLC Polyglot Hello Demo
 
 A Windows app that uses the **WSL Containers SDK** (`Microsoft.WSL.Containers`)
-to run **one Debian container** that prints "hello world" in **~20 programming
+to run **one Debian container** that prints "hello world" in **27 programming
 languages**, in **TIOBE popularity rank order**. For each language the container
 emits two channel-tagged lines to stdout:
 
@@ -13,7 +13,7 @@ emits two channel-tagged lines to stdout:
 The Windows app streams the container's stdout to the console. There is **no
 real HTTP server** — `[cli]` / `[http]` are just labels the container prints.
 
-The ~20 languages are built into one image via the SDK's `WslcImage` build
+The 27 languages are built into one image via the SDK's `WslcImage` build
 targets (`wslc image build` at `dotnet build` time). Compiled languages
 (C, C++, Rust, Go, Ada, Assembly, Fortran, COBOL, OCaml, Haskell) are compiled
 into the image; interpreted ones run at container start.
@@ -37,10 +37,11 @@ dotnet build test/demo/wslc-polyglot-hello/app/WslcPolyglotHello.csproj -c Debug
 ```
 
 The project declares one `<WslcImage>` item; the SDK targets run
-`wslc image build` on `polyglot/Dockerfile` (installing ~20 toolchains and
+`wslc image build` on `polyglot/Dockerfile` (installing 27 toolchains and
 **compiling** the compiled languages) then `wslc image save` to `polyglot.tar`
-in the output dir. **The first build is slow** (~20 toolchains; the image and
-`polyglot.tar` are roughly 3 GB — the JDK, GHC, Go, and Rust dominate the size).
+in the output dir. **The first build is slow** (27 toolchains, several fetched
+from the network — Swift, Julia, Kotlin, Zig, Dart; the image and `polyglot.tar`
+are roughly 7 GB).
 
 ## Run it
 
@@ -67,6 +68,9 @@ server. On exit the container + session are torn down; re-runs start clean.
 
 ## Languages (TIOBE July-2026 rank order)
 
+27 languages — every top-50 language that runs as a Linux process (minus Scala,
+see below).
+
 | # | Rank | Language | How it runs |
 |---|---|---|---|
 | 1 | 1 | Python | interpreted |
@@ -78,23 +82,38 @@ server. On exit the container + session are torn down; re-runs start clean.
 | 7 | 10 | Rust | compiled at build |
 | 8 | 13 | Go | compiled at build |
 | 9 | 14 | PHP | interpreted |
-| 10 | 16 | Ada | compiled at build |
-| 11 | 17 | Assembly | assembled+linked at build |
-| 12 | 19 | Fortran | compiled at build |
-| 13 | 20 | Ruby | interpreted |
-| 14 | 22 | Perl | interpreted |
-| 15 | 23 | COBOL | compiled at build |
-| 16 | 24 | Prolog | SWI-Prolog |
-| 17 | 34 | Lua | interpreted |
-| 18 | 36 | OCaml | compiled at build |
-| 19 | 46 | Haskell | compiled at build |
-| 20 | — | Bash | interpreted |
+| 10 | 15 | Swift | interpreted (`swift`) |
+| 11 | 16 | Ada | compiled at build |
+| 12 | 17 | Assembly | assembled+linked at build |
+| 13 | 19 | Fortran | compiled at build |
+| 14 | 20 | Ruby | interpreted |
+| 15 | 22 | Perl | interpreted |
+| 16 | 23 | COBOL | compiled at build |
+| 17 | 24 | Prolog | SWI-Prolog |
+| 18 | 27 | Julia | interpreted |
+| 19 | 28 | Kotlin | compiled at build (→ jar) |
+| 20 | 32 | Dart | interpreted |
+| 21 | 33 | Lisp | SBCL script |
+| 22 | 34 | Lua | interpreted |
+| 23 | 36 | OCaml | compiled at build |
+| 24 | 46 | Haskell | compiled at build |
+| 25 | 47 | TypeScript | `tsc` at build → Node |
+| 26 | 48 | Zig | compiled at build |
+| 27 | — | Bash | interpreted |
 
-**Skipped** (can't run as a Linux process): Visual Basic, VBScript, SQL/PL-SQL/
-Transact-SQL, Scratch, GML, VHDL, Ladder Logic, LabVIEW, X++, ABAP, SAS, CFML,
-Objective-C (Apple-bound), MATLAB, Delphi, Caml/ML (superseded by OCaml), plus
-heavy toolchains omitted to keep the image small (Swift, Julia, Kotlin, Scala,
-Dart, D, Lisp).
+Compiled languages are built into the image at `dotnet build` time; interpreted
+ones run at container start. Toolchains not in Debian apt are fetched during the
+build: Swift (swift.org tarball), Julia (official tarball, 1.11+), Zig (official
+tarball), Kotlin (JetBrains GitHub release), Dart (Google apt repo).
+
+**Skipped:**
+- **Can't run as a Linux process:** Visual Basic, Classic VB, VBScript, SQL/
+  PL-SQL/Transact-SQL, Scratch, GML, VHDL, Ladder Logic, LabVIEW, X++, ABAP, SAS,
+  CFML, Objective-C (Apple-bound), MATLAB, Delphi, Caml/ML (superseded by OCaml).
+- **Scala** — runnable in Linux, but its toolchain download (Scala 3 GitHub
+  release) failed with a repeatable TLS error from inside the build container in
+  this environment. Excluded pending a reliable fetch path, not a language
+  limitation. (D was also left out — lower-ranked, not yet added.)
 
 ## Troubleshooting
 

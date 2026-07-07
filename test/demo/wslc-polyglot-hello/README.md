@@ -39,7 +39,8 @@ dotnet build test/demo/wslc-polyglot-hello/app/WslcPolyglotHello.csproj -c Debug
 The project declares one `<WslcImage>` item; the SDK targets run
 `wslc image build` on `polyglot/Dockerfile` (installing ~20 toolchains and
 **compiling** the compiled languages) then `wslc image save` to `polyglot.tar`
-in the output dir. **The first build is slow** (~20 toolchains; image ~1–1.5 GB).
+in the output dir. **The first build is slow** (~20 toolchains; the image and
+`polyglot.tar` are roughly 3 GB — the JDK, GHC, Go, and Rust dominate the size).
 
 ## Run it
 

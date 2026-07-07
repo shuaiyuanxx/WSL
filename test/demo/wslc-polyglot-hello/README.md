@@ -2,16 +2,25 @@
 
 A Windows app that uses the **WSL Containers SDK** (`Microsoft.WSL.Containers`)
 to run **one Debian container** that prints "hello world" in **27 programming
-languages**, in **TIOBE popularity rank order**. For each language the container
-emits two channel-tagged lines to stdout:
+languages**, in **TIOBE popularity rank order**. It demonstrates **two output
+channels**:
+
+- **`[cli]`** — every language prints its line to the container's **stdout**,
+  which the SDK streams to the Windows console (all 27 languages).
+- **`[tcp]`** — **18** of the languages *also* send their line over a **real TCP
+  socket** to the Windows app, which prints it (see "Real TCP channel" below).
+
+So the console shows, per participating language:
 
 ```
 [cli] hello world from [python]
-[http] hello world from [python]
+[tcp] hello world from [python]
 ```
 
-The Windows app streams the container's stdout to the console. There is **no
-real HTTP server** — `[cli]` / `[http]` are just labels the container prints.
+The `[cli]` line comes over stdout; the `[tcp]` line is a genuine socket message
+that travelled container → Windows. The 9 languages where a raw socket is
+disproportionate (assembly, cobol, fortran, ada, prolog, lisp, zig, haskell,
+bash) emit `[cli]` only.
 
 The 27 languages are built into one image via the SDK's `WslcImage` build
 targets (`wslc image build` at `dotnet build` time). Compiled languages
@@ -49,27 +58,71 @@ are roughly 7 GB).
 dotnet run --project test/demo/wslc-polyglot-hello/app/WslcPolyglotHello.csproj -c Debug
 ```
 
-The app loads `polyglot.tar`, starts the container, and streams its stdout. You
-get two tagged lines per language, in TIOBE order:
+The app loads `polyglot.tar`, starts the container, streams its stdout (the
+`[cli]` lines), and reads the `[tcp]` lines over a real socket. You get 27
+`[cli]` lines (all languages) and 18 `[tcp]` lines (the send-group), for example:
 
 ```
 [cli] hello world from [python]
-[http] hello world from [python]
+[tcp] hello world from [python]
 [cli] hello world from [c]
-[http] hello world from [c]
-... 40 lines total ...
+[tcp] hello world from [c]
+[cli] hello world from [assembly]     # cli only — no [tcp] for skip-group
+...
 [cli] hello world from [bash]
-[http] hello world from [bash]
 [done] run-all.sh exited code=0
 ```
 
-`[cli]` / `[http]` are just labels the container prints — there is no real HTTP
-server. On exit the container + session are torn down; re-runs start clean.
+> **The `[tcp]` lines can take up to ~1 minute to appear.** The container's TCP
+> port is exposed to Windows via the SDK's port mapping, which in this WSL
+> version can take ~30–55 s to become stably reachable. The app keeps retrying
+> and the container waits for delivery, so a full run may take a couple of
+> minutes. `[cli]` lines appear immediately; `[tcp]` lines arrive once the
+> mapping is up.
+
+On exit the container + session are torn down; re-runs start clean.
+
+## Real TCP channel
+
+The `[tcp]` lines are **genuine TCP socket messages** sent from the container to
+the Windows app — not a label. How it works:
+
+- **Container = TCP server.** A small aggregator (`polyglot/tcp_server.py`)
+  listens inside the container: `127.0.0.1:9098` for the language senders, and
+  `0.0.0.0:9099` for the Windows downstream. Each send-group language runs a
+  tiny `senders/send.<ext>` program that connects to `:9098` and sends its line;
+  the aggregator buffers and forwards them to the Windows connection.
+- **SDK maps the port.** `Program.cs` sets `NetworkingMode = Bridged` and
+  `PortMappings = { new(9099, 9099, TCP) }`, exposing the container's `9099` on
+  Windows `localhost:9099`.
+- **Windows = client.** The app's background `TcpClient` connects to
+  `localhost:9099` and prints each received line as `[tcp] ...`.
+
+**Why the container is the server (not Windows):** in the WSLC network a
+container **cannot** initiate a connection to a Windows host port (inbound is
+blocked by the WSL Hyper-V firewall — verified: `Connection refused`). The
+supported direction is **host → container** via `PortMappings`. So the container
+listens and Windows connects. (A Windows-side `HttpListener`/server on a
+non-localhost address also needs admin, another reason to put the server in the
+container.)
+
+**Timing notes baked into the code:** the WSLC port-proxy accepts and instantly
+closes connections to the mapped port *before* the in-container aggregator is
+listening — so the Windows reader retries past empty closes until it actually
+receives a line; `run-all.sh` waits for the aggregator so the container doesn't
+exit before delivery; and the aggregator has bounded timeouts so nothing hangs
+forever.
 
 ## Languages (TIOBE July-2026 rank order)
 
 27 languages — every top-50 language that runs as a Linux process (minus Scala,
 see below).
+
+**TCP send-group (18)** — emit `[cli]` AND send `[tcp]` over a real socket:
+python, javascript, ruby, php, perl, lua, r, go, rust, java, kotlin, dart,
+julia, swift, typescript, c, c++, ocaml.
+**`[cli]`-only (9)** — a raw socket is disproportionate for a demo: assembly,
+cobol, fortran, ada, prolog, lisp, zig, haskell, bash.
 
 | # | Rank | Language | How it runs |
 |---|---|---|---|
@@ -123,4 +176,17 @@ tarball), Kotlin (JetBrains GitHub release), Dart (Google apt repo).
 - **`error CS1705`:** bump `<WindowsSdkPackageVersion>`.
 - **Platform error about x64/arm64:** build x64 (the csproj pins it).
 - **A language failed → the run aborts (fail-fast):** read the last
-  `run-all: FAILED at [<lang>]` line on stderr and the exit code.
+  `run-all: FAILED at [<lang>]` line on stderr and the exit code. A send-group
+  language whose TCP send fails aborts with `run-all: FAILED at [<lang>] (tcp)`.
+- **No `[tcp]` lines appear:** the SDK port mapping (`localhost:9099`) may not
+  have become reachable — it can take ~30–55 s in this WSL version, and the app
+  retries for ~150 s. Confirm nothing else on Windows holds port 9099, and that
+  the container printed `tcp_server: listening`. `[cli]` lines are unaffected.
+- **`dotnet build` fails at the `WslcImage` target with `"/senders": not found`
+  (or similar):** the `wslc` BuildKit daemon can cache a stale/corrupt context
+  snapshot for the `polyglot/` path that survives even `wsl --shutdown`. Two
+  workarounds: (a) if a valid `polyglot.tar` already exists in the output dir,
+  `touch` it so the incremental check skips the image rebuild and only the C#
+  compiles; or (b) build the image from a *copied* context directory (a
+  different path gets a fresh context key), then `wslc image save` it to the
+  app output dir as `polyglot.tar`.

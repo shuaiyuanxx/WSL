@@ -1,0 +1,1 @@
+require 'socket'; TCPSocket.open('127.0.0.1',9098){|s| s.write "hello world from [ruby]\n"}

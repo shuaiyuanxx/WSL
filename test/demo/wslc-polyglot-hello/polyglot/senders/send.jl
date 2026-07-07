@@ -1,0 +1,1 @@
+using Sockets; s=connect("127.0.0.1",9098); write(s,"hello world from [julia]\n"); close(s)

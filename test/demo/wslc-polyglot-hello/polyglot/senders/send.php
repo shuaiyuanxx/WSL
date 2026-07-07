@@ -1,0 +1,1 @@
+<?php $s=fsockopen('127.0.0.1',9098); fwrite($s,"hello world from [php]\n"); fclose($s);

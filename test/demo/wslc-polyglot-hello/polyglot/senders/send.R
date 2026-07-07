@@ -1,0 +1,1 @@
+con<-socketConnection(host='127.0.0.1',port=9098,blocking=TRUE,open='w'); writeLines('hello world from [r]',con,sep='\n'); close(con)

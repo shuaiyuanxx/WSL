@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <!-- Raise the Windows SDK.NET ref pack for the SDK's C# projection (CS1705). -->
+    <WindowsSdkPackageVersion>10.0.26100.80</WindowsSdkPackageVersion>
+    <!-- The SDK's WslcImage targets call bare `wslc`; MSBuild's PATH may not
+         resolve it, so pin the full path (matches the wslc-multi-service demo). -->
+    <WslcCliPath>C:\Program Files\WSL\wslc.exe</WslcCliPath>
+    <Platforms>x64</Platforms>
+    <Platform>x64</Platform>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>WslcPolyglotHello</AssemblyName>
+    <RootNamespace>WslcPolyglotHello</RootNamespace>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WSL.Containers" Version="2.9.3" />
+  </ItemGroup>
+
+  <!-- Built at `dotnet build` time: wslc image build -t <Image> -f <Dockerfile>
+       <Context>, then wslc image save -o $(OutDir)polyglot.tar <Image>. -->
+  <ItemGroup>
+    <WslcImage Include="polyglot">
+      <Image>wslc-demo/polyglot:latest</Image>
+      <Dockerfile>$(MSBuildProjectDirectory)\..\polyglot\Dockerfile</Dockerfile>
+      <Context>$(MSBuildProjectDirectory)\..\polyglot</Context>
+    </WslcImage>
+  </ItemGroup>
+
+</Project>

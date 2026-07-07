@@ -100,13 +100,20 @@ try
     // Background: connect to the container's TCP aggregator (mapped to
     // localhost:9099) and print each received line. Best-effort — the
     // container-side hard-fail is the correctness gate; this only displays.
+    // The Bridged port mapping can take ~55s to become stably reachable on
+    // Windows, so retry-connect for a generous window (~150s) rather than a
+    // small fixed attempt count, until cancelled.
     using var tcpCts = new CancellationTokenSource();
     var tcpReader = Task.Run(async () =>
     {
-        for (int attempt = 0; attempt < 30 && !tcpCts.IsCancellationRequested; attempt++)
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(150);
+        int probes = 0;
+        int received = 0;
+        while (DateTime.UtcNow < deadline && !tcpCts.IsCancellationRequested && received == 0)
         {
             try
             {
+                probes++;
                 using var client = new System.Net.Sockets.TcpClient();
                 await client.ConnectAsync("127.0.0.1", 9099, tcpCts.Token);
                 using var reader = new StreamReader(client.GetStream());
@@ -114,11 +121,21 @@ try
                 while ((line = await reader.ReadLineAsync(tcpCts.Token)) is not null)
                 {
                     Console.WriteLine($"[tcp] {line}");
+                    received++;
                 }
-                return; // stream closed cleanly
+                // Stream closed. The WSLC port-proxy accepts (and immediately
+                // closes) connections before the in-container aggregator is
+                // actually listening on 9099. So an empty close is NOT "done" —
+                // only stop once we've received at least one line. Otherwise
+                // wait and reconnect.
+                if (received > 0) return;
+                try { await Task.Delay(1000, tcpCts.Token); } catch (OperationCanceledException) { return; }
             }
             catch (OperationCanceledException) { return; }
-            catch { await Task.Delay(1000, tcpCts.Token).ContinueWith(_ => { }); }
+            catch
+            {
+                try { await Task.Delay(1000, tcpCts.Token); } catch (OperationCanceledException) { return; }
+            }
         }
     });
 
@@ -126,7 +143,7 @@ try
     Console.WriteLine($"[done] run-all.sh exited code={exitCode}");
 
     // give the reader a moment to drain any final [tcp] lines, then stop it
-    await Task.WhenAny(tcpReader, Task.Delay(2000));
+    await Task.WhenAny(tcpReader, Task.Delay(5000));
     tcpCts.Cancel();
 }
 catch (Exception ex)

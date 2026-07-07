@@ -13,6 +13,7 @@ SND=/app/senders
 
 # ---- Start the TCP aggregator and wait until it is listening -----------------
 python3 /app/tcp_server.py &
+AGG_PID=$!
 for _ in $(seq 1 50); do
     if (exec 3<>/dev/tcp/127.0.0.1/9098) 2>/dev/null; then exec 3>&- 3<&-; break; fi
     sleep 0.2
@@ -78,3 +79,11 @@ cli zig        "$BIN/hello_zig"
 cli bash       bash "$HELLO/hello.sh"
 
 echo "run-all: all languages OK" >&2
+
+# The 18 TCP sends are buffered in the aggregator until the Windows client
+# connects (its mapped port can take ~15s to become active). Keep the container
+# alive by waiting for the aggregator to finish forwarding — it exits after
+# Windows connects + drains, or after its own 90s no-connect timeout. Without
+# this wait, run-all.sh (the init process) would return and the container would
+# stop, killing the aggregator before the [tcp] lines are delivered.
+wait "$AGG_PID" 2>/dev/null || true

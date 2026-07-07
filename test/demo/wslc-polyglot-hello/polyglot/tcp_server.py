@@ -41,17 +41,38 @@ def main() -> None:
     down.listen(1)
     print("tcp_server: listening (9098 senders / 9099 windows)", flush=True)
 
-    win, _ = down.accept()
-    print("tcp_server: windows connected", flush=True)
-    try:
-        while True:
-            try:
-                item = q.get(timeout=20)
-            except queue.Empty:
-                break
-            win.sendall(item)
-    finally:
-        win.close()
+    # The Windows client connects via a mapped port that can take ~55s to become
+    # stably reachable, and early flaky connects may drop immediately. Keep
+    # accepting downstream connections (each with a bounded wait) until we have
+    # forwarded at least one queued item, or until an overall deadline so
+    # run-all.sh's `wait` on us can't hang the container forever.
+    import time
+    deadline = time.monotonic() + 150
+    forwarded = 0
+    while forwarded == 0 and time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        down.settimeout(max(1.0, remaining))
+        try:
+            win, _ = down.accept()
+        except socket.timeout:
+            break
+        print("tcp_server: windows connected", flush=True)
+        try:
+            # forward queued + subsequent lines; stop after a 15s idle gap
+            while True:
+                try:
+                    item = q.get(timeout=15)
+                except queue.Empty:
+                    break
+                win.sendall(item)
+                forwarded += 1
+        except OSError:
+            # connection dropped (flaky early mapping) — loop and re-accept
+            pass
+        finally:
+            win.close()
+    if forwarded == 0:
+        print("tcp_server: windows never connected; exiting", flush=True)
 
 
 if __name__ == "__main__":

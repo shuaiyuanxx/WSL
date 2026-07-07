@@ -75,6 +75,11 @@ try
         Name = ContainerName,
         InitProcess = initProcess,
         EnableAutoRemove = true,               // clean re-run even after a crash
+        NetworkingMode = ContainerNetworkingMode.Bridged,   // required for PortMappings
+        PortMappings = new List<ContainerPortMapping>
+        {
+            new(9099, 9099, PortProtocol.TCP),              // container 9099 -> Windows localhost:9099
+        },
     };
 
     var container = session.CreateContainer(containerSettings);
@@ -92,8 +97,37 @@ try
     container.Start();
     Console.WriteLine("polyglot container started; streaming output...");
 
+    // Background: connect to the container's TCP aggregator (mapped to
+    // localhost:9099) and print each received line. Best-effort — the
+    // container-side hard-fail is the correctness gate; this only displays.
+    using var tcpCts = new CancellationTokenSource();
+    var tcpReader = Task.Run(async () =>
+    {
+        for (int attempt = 0; attempt < 30 && !tcpCts.IsCancellationRequested; attempt++)
+        {
+            try
+            {
+                using var client = new System.Net.Sockets.TcpClient();
+                await client.ConnectAsync("127.0.0.1", 9099, tcpCts.Token);
+                using var reader = new StreamReader(client.GetStream());
+                string? line;
+                while ((line = await reader.ReadLineAsync(tcpCts.Token)) is not null)
+                {
+                    Console.WriteLine($"[tcp] {line}");
+                }
+                return; // stream closed cleanly
+            }
+            catch (OperationCanceledException) { return; }
+            catch { await Task.Delay(1000, tcpCts.Token).ContinueWith(_ => { }); }
+        }
+    });
+
     exitCode = await done.Task;                // run-all.sh exit code (non-zero = fail-fast)
     Console.WriteLine($"[done] run-all.sh exited code={exitCode}");
+
+    // give the reader a moment to drain any final [tcp] lines, then stop it
+    await Task.WhenAny(tcpReader, Task.Delay(2000));
+    tcpCts.Cancel();
 }
 catch (Exception ex)
 {

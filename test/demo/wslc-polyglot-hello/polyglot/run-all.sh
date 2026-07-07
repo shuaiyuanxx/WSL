@@ -74,7 +74,7 @@ cli lisp       sbcl --script "$HELLO/hello.lisp"
 cli lua        lua5.4 "$HELLO/hello.lua";         tcp lua        lua5.4 "$SND/send.lua"
 cli ocaml      "$BIN/hello_ocaml";                tcp ocaml      "$SBIN/send_ocaml"
 cli haskell    "$BIN/hello_haskell"
-cli typescript node "$BIN/hello_ts.js";           tcp typescript node "$SND/send.js"
+cli typescript node "$BIN/hello_ts.js";           tcp typescript node "$SBIN/send.js"
 cli zig        "$BIN/hello_zig"
 cli bash       bash "$HELLO/hello.sh"
 

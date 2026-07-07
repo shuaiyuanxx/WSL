@@ -81,7 +81,7 @@ RUN mkdir -p /app/senders/bin \
  && ocamlopt unix.cmxa /app/senders/send.ml -o /app/senders/bin/send_ocaml \
  && kotlinc /app/senders/Send.kt -include-runtime -d /app/senders/bin/send_kt.jar \
  && (cd /app/senders && javac Send.java -d /app/senders/bin) \
- && tsc /app/senders/send.ts \
+ && tsc --outDir /app/senders/bin /app/senders/send.ts \
  && (cd /app/senders && dart compile exe send.dart -o /app/senders/bin/send_dart)
 
 CMD ["/app/run-all.sh"]

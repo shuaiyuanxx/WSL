@@ -107,13 +107,11 @@ try
     var tcpReader = Task.Run(async () =>
     {
         var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(150);
-        int probes = 0;
         int received = 0;
         while (DateTime.UtcNow < deadline && !tcpCts.IsCancellationRequested && received == 0)
         {
             try
             {
-                probes++;
                 using var client = new System.Net.Sockets.TcpClient();
                 await client.ConnectAsync("127.0.0.1", 9099, tcpCts.Token);
                 using var reader = new StreamReader(client.GetStream());

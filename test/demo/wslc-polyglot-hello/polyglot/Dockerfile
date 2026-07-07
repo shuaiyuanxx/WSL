@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 default-jdk nodejs r-base rustc golang php-cli ruby perl \
         swi-prolog lua5.4 \
         gcc g++ gfortran gnat gnucobol ocaml-nox ghc binutils libc6-dev \
-        sbcl node-typescript \
+        sbcl node-typescript lua-socket \
         curl unzip xz-utils gnupg apt-transport-https ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
@@ -67,5 +67,21 @@ RUN mkdir -p /app/bin \
  && zig build-exe /app/hello/hello.zig -femit-bin=/app/bin/hello_zig -O ReleaseSafe \
  && kotlinc /app/hello/Hello.kt -include-runtime -d /app/bin/hello_kt.jar \
  && tsc --outFile /app/bin/hello_ts.js /app/hello/hello.ts
+
+COPY tcp_server.py /app/tcp_server.py
+COPY senders/ /app/senders/
+
+# Compile the compiled-language senders into /app/senders/bin (interpreted
+# senders run from source at container start).
+RUN mkdir -p /app/senders/bin \
+ && gcc  -o /app/senders/bin/send_c   /app/senders/send.c \
+ && g++  -o /app/senders/bin/send_cpp /app/senders/send.cpp \
+ && rustc -o /app/senders/bin/send_rust /app/senders/send.rs \
+ && (cd /app/senders && go build -o /app/senders/bin/send_go send.go) \
+ && ocamlopt unix.cmxa /app/senders/send.ml -o /app/senders/bin/send_ocaml \
+ && kotlinc /app/senders/Send.kt -include-runtime -d /app/senders/bin/send_kt.jar \
+ && (cd /app/senders && javac Send.java -d /app/senders/bin) \
+ && tsc /app/senders/send.ts \
+ && (cd /app/senders && dart compile exe send.dart -o /app/senders/bin/send_dart)
 
 CMD ["/app/run-all.sh"]

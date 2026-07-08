@@ -78,7 +78,15 @@ try
         NetworkingMode = ContainerNetworkingMode.Bridged,   // required for PortMappings
         PortMappings = new List<ContainerPortMapping>
         {
-            new(9099, 9099, PortProtocol.TCP),              // container 9099 -> Windows localhost:9099
+            new(7001, 7001, PortProtocol.TCP), new(7002, 7002, PortProtocol.TCP),
+            new(7003, 7003, PortProtocol.TCP), new(7004, 7004, PortProtocol.TCP),
+            new(7005, 7005, PortProtocol.TCP), new(7006, 7006, PortProtocol.TCP),
+            new(7007, 7007, PortProtocol.TCP), new(7008, 7008, PortProtocol.TCP),
+            new(7009, 7009, PortProtocol.TCP), new(7010, 7010, PortProtocol.TCP),
+            new(7011, 7011, PortProtocol.TCP), new(7012, 7012, PortProtocol.TCP),
+            new(7013, 7013, PortProtocol.TCP), new(7014, 7014, PortProtocol.TCP),
+            new(7015, 7015, PortProtocol.TCP), new(7016, 7016, PortProtocol.TCP),
+            new(7017, 7017, PortProtocol.TCP), new(7018, 7018, PortProtocol.TCP),
         },
     };
 
@@ -97,51 +105,54 @@ try
     container.Start();
     Console.WriteLine("polyglot container started; streaming output...");
 
-    // Background: connect to the container's TCP aggregator (mapped to
-    // localhost:9099) and print each received line. Best-effort — the
-    // container-side hard-fail is the correctness gate; this only displays.
-    // The Bridged port mapping can take ~55s to become stably reachable on
-    // Windows, so retry-connect for a generous window (~150s) rather than a
-    // small fixed attempt count, until cancelled.
+    // Per-language TCP handshake: connect SEQUENTIALLY to each mapped server
+    // port, send "send", read the hello, send "ack" (server then exits), print
+    // [tcp]. The Bridged mapping can take ~30-55s per port to become reachable,
+    // and the WSLC proxy may accept+immediately-close before the in-container
+    // server is listening — so retry each port until a FULL handshake completes.
     using var tcpCts = new CancellationTokenSource();
-    var tcpReader = Task.Run(async () =>
+    (string lang, int port)[] servers =
     {
-        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(150);
-        int received = 0;
-        while (DateTime.UtcNow < deadline && !tcpCts.IsCancellationRequested && received == 0)
+        ("python",7001),("javascript",7002),("ruby",7003),("php",7004),
+        ("perl",7005),("lua",7006),("r",7007),("go",7008),("rust",7009),
+        ("java",7010),("kotlin",7011),("dart",7012),("julia",7013),
+        ("typescript",7014),("c",7015),("c++",7016),("ocaml",7017),("swift",7018),
+    };
+    var tcpWork = Task.Run(async () =>
+    {
+        foreach (var (lang, port) in servers)
         {
-            try
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(120);
+            string? hello = null;
+            while (hello is null && DateTime.UtcNow < deadline && !tcpCts.IsCancellationRequested)
             {
-                using var client = new System.Net.Sockets.TcpClient();
-                await client.ConnectAsync("127.0.0.1", 9099, tcpCts.Token);
-                using var reader = new StreamReader(client.GetStream());
-                string? line;
-                while ((line = await reader.ReadLineAsync(tcpCts.Token)) is not null)
+                try
                 {
-                    Console.WriteLine($"[tcp] {line}");
-                    received++;
+                    using var client = new System.Net.Sockets.TcpClient();
+                    await client.ConnectAsync("127.0.0.1", port, tcpCts.Token);
+                    var ns = client.GetStream();
+                    await ns.WriteAsync(Encoding.UTF8.GetBytes("send\n"), tcpCts.Token);
+                    using var reader = new StreamReader(ns);
+                    var line = await reader.ReadLineAsync(tcpCts.Token);
+                    if (!string.IsNullOrEmpty(line))
+                    {
+                        await ns.WriteAsync(Encoding.UTF8.GetBytes("ack\n"), tcpCts.Token);
+                        hello = line;                    // full handshake done
+                    }
                 }
-                // Stream closed. The WSLC port-proxy accepts (and immediately
-                // closes) connections before the in-container aggregator is
-                // actually listening on 9099. So an empty close is NOT "done" —
-                // only stop once we've received at least one line. Otherwise
-                // wait and reconnect.
-                if (received > 0) return;
-                try { await Task.Delay(1000, tcpCts.Token); } catch (OperationCanceledException) { return; }
+                catch (OperationCanceledException) { return; }
+                catch { try { await Task.Delay(1000, tcpCts.Token); } catch (OperationCanceledException) { return; } }
             }
-            catch (OperationCanceledException) { return; }
-            catch
-            {
-                try { await Task.Delay(1000, tcpCts.Token); } catch (OperationCanceledException) { return; }
-            }
+            if (hello is not null) Console.WriteLine($"[tcp] {hello}");
+            else Console.Error.WriteLine($"[tcp] FAILED to handshake [{lang}] on port {port}");
         }
     });
 
     exitCode = await done.Task;                // run-all.sh exit code (non-zero = fail-fast)
     Console.WriteLine($"[done] run-all.sh exited code={exitCode}");
 
-    // give the reader a moment to drain any final [tcp] lines, then stop it
-    await Task.WhenAny(tcpReader, Task.Delay(5000));
+    // give the handshake loop a moment to finish any final [tcp] line, then stop it
+    await Task.WhenAny(tcpWork, Task.Delay(5000));
     tcpCts.Cancel();
 }
 catch (Exception ex)

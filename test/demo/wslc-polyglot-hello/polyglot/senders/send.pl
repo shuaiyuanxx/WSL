@@ -1,1 +1,0 @@
-use IO::Socket::INET; my $s=IO::Socket::INET->new(PeerAddr=>'127.0.0.1',PeerPort=>9098,Proto=>'tcp'); print $s "hello world from [perl]\n"; close($s);

@@ -7,8 +7,9 @@ channels**:
 
 - **`[cli]`** — every language prints its line to the container's **stdout**,
   which the SDK streams to the Windows console (all 27 languages).
-- **`[tcp]`** — **18** of the languages *also* send their line over a **real TCP
-  socket** to the Windows app, which prints it (see "Real TCP channel" below).
+- **`[tcp]`** — **18** of the languages *also* run their own **TCP server**; the
+  Windows app connects to each and does a `send`→`hello`→`ack` handshake to get
+  its line over a **real socket** (see "Real TCP channel" below).
 
 So the console shows, per participating language:
 
@@ -59,8 +60,9 @@ dotnet run --project test/demo/wslc-polyglot-hello/app/WslcPolyglotHello.csproj 
 ```
 
 The app loads `polyglot.tar`, starts the container, streams its stdout (the
-`[cli]` lines), and reads the `[tcp]` lines over a real socket. You get 27
-`[cli]` lines (all languages) and 18 `[tcp]` lines (the send-group), for example:
+`[cli]` lines), and handshakes with each language's TCP server to get the
+`[tcp]` lines. You get 27 `[cli]` lines (all languages) and 18 `[tcp]` lines (the
+languages with a TCP server), for example:
 
 ```
 [cli] hello world from [python]
@@ -84,44 +86,69 @@ On exit the container + session are torn down; re-runs start clean.
 
 ## Real TCP channel
 
-The `[tcp]` lines are **genuine TCP socket messages** sent from the container to
-the Windows app — not a label. How it works:
+The `[tcp]` lines are **genuine TCP socket messages** exchanged between the
+container and the Windows app — not a label. Each of the 18 participating
+languages runs its **own** TCP server on its **own** port; the Windows app
+connects to each in turn and performs a request/response/ack handshake.
 
-- **Container = TCP server.** A small aggregator (`polyglot/tcp_server.py`)
-  listens inside the container: `127.0.0.1:9098` for the language senders, and
-  `0.0.0.0:9099` for the Windows downstream. Each send-group language runs a
-  tiny `senders/send.<ext>` program that connects to `:9098` and sends its line;
-  the aggregator buffers and forwards them to the Windows connection.
-- **SDK maps the port.** `Program.cs` sets `NetworkingMode = Bridged` and
-  `PortMappings = { new(9099, 9099, TCP) }`, exposing the container's `9099` on
-  Windows `localhost:9099`.
-- **Windows = client.** The app's background `TcpClient` connects to
-  `localhost:9099` and prints each received line as `[tcp] ...`.
+- **Each language = its own TCP server.** `polyglot/servers/srv.<ext>` (one per
+  language) binds `0.0.0.0:<port>`, waits (`accept`), and stays active until the
+  Windows client talks to it. Ports are fixed 7001–7018 (see the port table
+  below).
+- **SDK maps 18 ports.** `Program.cs` sets `NetworkingMode = Bridged` and 18
+  `PortMappings` (`7001→7001 … 7018→7018`), exposing each language server on
+  Windows `localhost:<port>`.
+- **Windows = client, sequential.** After the container starts, the app connects
+  to each port **in order** and runs this handshake per language:
+
+  ```
+  Windows → server:  send
+  server  → Windows: hello world from [<lang>]
+  Windows → server:  ack
+  server exits
+  ```
+
+  The app prints `[tcp] hello world from [<lang>]` after each successful
+  handshake.
 
 **Why the container is the server (not Windows):** in the WSLC network a
 container **cannot** initiate a connection to a Windows host port (inbound is
 blocked by the WSL Hyper-V firewall — verified: `Connection refused`). The
-supported direction is **host → container** via `PortMappings`. So the container
+supported direction is **host → container** via `PortMappings`. So each language
 listens and Windows connects. (A Windows-side `HttpListener`/server on a
-non-localhost address also needs admin, another reason to put the server in the
+non-localhost address also needs admin, another reason to put the servers in the
 container.)
 
-**Timing notes baked into the code:** the WSLC port-proxy accepts and instantly
-closes connections to the mapped port *before* the in-container aggregator is
-listening — so the Windows reader retries past empty closes until it actually
-receives a line; `run-all.sh` waits for the aggregator so the container doesn't
-exit before delivery; and the aggregator has bounded timeouts so nothing hangs
+**Timing:** each of the 18 port mappings can take ~30–55 s to become reachable,
+the WSLC port-proxy may accept+immediately-close a port before its server is
+listening (so the app retries each port until the *full* handshake completes),
+and Windows connects **sequentially** — so a full run can take **several
+minutes**. `run-all.sh` launches all 18 servers in the background and `wait`s for
+them (each exits after its ack), with a bounded overall timeout so nothing hangs
 forever.
+
+### Port assignment
+
+| Port | Lang | Port | Lang | Port | Lang |
+|---|---|---|---|---|---|
+| 7001 | python | 7007 | r | 7013 | julia |
+| 7002 | javascript | 7008 | go | 7014 | typescript |
+| 7003 | ruby | 7009 | rust | 7015 | c |
+| 7004 | php | 7010 | java | 7016 | c++ |
+| 7005 | perl | 7011 | kotlin | 7017 | ocaml |
+| 7006 | lua | 7012 | dart | 7018 | swift |
+
 
 ## Languages (TIOBE July-2026 rank order)
 
 27 languages — every top-50 language that runs as a Linux process (minus Scala,
 see below).
 
-**TCP send-group (18)** — emit `[cli]` AND send `[tcp]` over a real socket:
+**TCP servers (18)** — emit `[cli]` AND run a per-language TCP server (port
+7001–7018) that handshakes with the Windows app to deliver `[tcp]`:
 python, javascript, ruby, php, perl, lua, r, go, rust, java, kotlin, dart,
 julia, swift, typescript, c, c++, ocaml.
-**`[cli]`-only (9)** — a raw socket is disproportionate for a demo: assembly,
+**`[cli]`-only (9)** — a TCP server is disproportionate for a demo: assembly,
 cobol, fortran, ada, prolog, lisp, zig, haskell, bash.
 
 | # | Rank | Language | How it runs |
@@ -176,12 +203,17 @@ tarball), Kotlin (JetBrains GitHub release), Dart (Google apt repo).
 - **`error CS1705`:** bump `<WindowsSdkPackageVersion>`.
 - **Platform error about x64/arm64:** build x64 (the csproj pins it).
 - **A language failed → the run aborts (fail-fast):** read the last
-  `run-all: FAILED at [<lang>]` line on stderr and the exit code. A send-group
-  language whose TCP send fails aborts with `run-all: FAILED at [<lang>] (tcp)`.
-- **No `[tcp]` lines appear:** the SDK port mapping (`localhost:9099`) may not
-  have become reachable — it can take ~30–55 s in this WSL version, and the app
-  retries for ~150 s. Confirm nothing else on Windows holds port 9099, and that
-  the container printed `tcp_server: listening`. `[cli]` lines are unaffected.
+  `run-all: FAILED at [<lang>]` line on stderr and the exit code. A TCP server
+  that crashes or never gets its client aborts with
+  `run-all: FAILED: server pid <n> ...`.
+- **No `[tcp]` lines appear:** the SDK port mappings (`localhost:7001–7018`) may
+  not have become reachable — each can take ~30–55 s in this WSL version, and the
+  app retries each port for ~120 s. Confirm nothing else on Windows holds ports
+  7001–7018. `[cli]` lines are unaffected.
+- **Some `[tcp] FAILED to handshake` lines:** that language's server never became
+  reachable within the per-port retry window (120 s). Check the container stderr
+  for that server crashing, and that its port (see the table above) is free on
+  Windows.
 - **`dotnet build` fails at the `WslcImage` target with `"/senders": not found`
   (or similar):** the `wslc` BuildKit daemon can cache a stale/corrupt context
   snapshot for the `polyglot/` path that survives even `wsl --shutdown`. Two

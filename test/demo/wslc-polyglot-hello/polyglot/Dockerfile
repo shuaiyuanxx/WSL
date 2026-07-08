@@ -68,20 +68,19 @@ RUN mkdir -p /app/bin \
  && kotlinc /app/hello/Hello.kt -include-runtime -d /app/bin/hello_kt.jar \
  && tsc --outFile /app/bin/hello_ts.js /app/hello/hello.ts
 
-COPY tcp_server.py /app/tcp_server.py
-COPY senders/ /app/senders/
+COPY servers/ /app/servers/
 
-# Compile the compiled-language senders into /app/senders/bin (interpreted
-# senders run from source at container start).
-RUN mkdir -p /app/senders/bin \
- && gcc  -o /app/senders/bin/send_c   /app/senders/send.c \
- && g++  -o /app/senders/bin/send_cpp /app/senders/send.cpp \
- && rustc -o /app/senders/bin/send_rust /app/senders/send.rs \
- && (cd /app/senders && go build -o /app/senders/bin/send_go send.go) \
- && ocamlopt unix.cmxa /app/senders/send.ml -o /app/senders/bin/send_ocaml \
- && kotlinc /app/senders/Send.kt -include-runtime -d /app/senders/bin/send_kt.jar \
- && (cd /app/senders && javac Send.java -d /app/senders/bin) \
- && tsc --outDir /app/senders/bin /app/senders/send.ts \
- && (cd /app/senders && dart compile exe send.dart -o /app/senders/bin/send_dart)
+# Compile the compiled-language servers into /app/servers/bin (interpreted
+# servers run from source at container start). Validated by the 18/18 probe.
+RUN mkdir -p /app/servers/bin \
+ && gcc  -o /app/servers/bin/srv_c   /app/servers/srv.c \
+ && g++  -o /app/servers/bin/srv_cpp /app/servers/srv.cpp \
+ && rustc -o /app/servers/bin/srv_rust /app/servers/srv.rs \
+ && (cd /app/servers && go build -o /app/servers/bin/srv_go srv.go) \
+ && ocamlopt unix.cmxa /app/servers/srv.ml -o /app/servers/bin/srv_ocaml \
+ && kotlinc /app/servers/Srv.kt -include-runtime -d /app/servers/bin/srv_kt.jar \
+ && (cd /app/servers && javac Srv.java -d /app/servers/bin) \
+ && tsc --outDir /app/servers/bin /app/servers/srv.ts \
+ && (cd /app/servers && dart compile exe srv.dart -o /app/servers/bin/srv_dart)
 
 CMD ["/app/run-all.sh"]

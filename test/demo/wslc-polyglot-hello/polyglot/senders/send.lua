@@ -1,1 +1,0 @@
-local socket=require('socket'); local c=socket.tcp(); c:connect('127.0.0.1',9098); c:send('hello world from [lua]\n'); c:close()

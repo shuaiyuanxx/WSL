@@ -64,11 +64,11 @@ try
     Console.WriteLine($"[load] LoadImageAsync <- {tarPath}");
     await session.LoadImageAsync(tarPath);
 
-    var initProcess = new ProcessSettings
-    {
-        CommandLine = new List<string>(),      // empty -> image CMD (run-all.sh)
-        OutputMode = ProcessOutputMode.Event,
-    };
+    // pid-1 stays alive (sleep) so the Windows app can CreateProcess into the
+    // running container and orchestrate everything itself — no run-all.sh.
+    var initProcess = new ProcessSettings { OutputMode = ProcessOutputMode.Event };
+    initProcess.CommandLine.Add("sleep");
+    initProcess.CommandLine.Add("infinity");
 
     var containerSettings = new ContainerSettings(ImageTag)
     {
@@ -93,17 +93,115 @@ try
     var container = session.CreateContainer(containerSettings);
     containers.Add(container);
 
-    // The sequence is finite: complete when run-all.sh exits.
-    var done = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
-    container.InitProcess.OutputReceived += data => Console.Write(Encoding.UTF8.GetString(data));
-    container.InitProcess.ErrorReceived += data => Console.Error.Write(Encoding.UTF8.GetString(data));
-    container.InitProcess.Exited += code => done.TrySetResult(code);
-
     // Ctrl+C as a fallback so the user can abort a stuck run into cleanup.
-    Console.CancelKeyPress += (_, e) => { e.Cancel = true; done.TrySetResult(-1); };
+    Console.CancelKeyPress += (_, e) => { e.Cancel = true; Environment.Exit(130); };
 
     container.Start();
-    Console.WriteLine("polyglot container started; streaming output...");
+    Console.WriteLine("polyglot container started (pid-1 = sleep); orchestrating...");
+
+    // ---- helpers: run a process inside the container via CreateProcess -------
+
+    // Run one program to completion; capture stdout, assert non-empty, return it.
+    // Throws on non-zero exit or empty output (fail-fast, same as the old script).
+    async Task<string> ExecCaptureAsync(string label, params string[] argv)
+    {
+        var ps = new ProcessSettings { OutputMode = ProcessOutputMode.Event };
+        foreach (var a in argv) ps.CommandLine.Add(a);
+
+        var sb = new StringBuilder();
+        var exited = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var proc = container.CreateProcess(ps);
+        proc.OutputReceived += d => sb.Append(Encoding.UTF8.GetString(d));
+        proc.ErrorReceived += d => Console.Error.Write(Encoding.UTF8.GetString(d));
+        proc.Exited += code => exited.TrySetResult(code);
+        proc.Start();
+        if (proc.State == ProcessState.Exited) exited.TrySetResult(proc.ExitCode);
+
+        int code = await exited.Task;
+        await Task.Delay(50);                  // let any final OutputReceived chunk drain
+        string outText = sb.ToString().Trim();
+        if (code != 0) throw new Exception($"[{label}] exited {code}");
+        if (outText.Length == 0) throw new Exception($"[{label}] produced no output");
+        return outText;
+    }
+
+    // Launch a long-running server process in the background (do not await exit).
+    // Returns the Process so we can wait on it after the handshakes.
+    Process ExecBackground(params string[] argv)
+    {
+        var ps = new ProcessSettings { OutputMode = ProcessOutputMode.Event };
+        foreach (var a in argv) ps.CommandLine.Add(a);
+        var proc = container.CreateProcess(ps);
+        proc.ErrorReceived += d => Console.Error.Write(Encoding.UTF8.GetString(d));
+        proc.Start();
+        return proc;
+    }
+
+    const string HELLO = "/app/hello";
+    const string BIN = "/app/bin";
+    const string SRV = "/app/servers";
+    const string SBIN = "/app/servers/bin";
+
+    // ---- Launch the 18 per-language TCP servers (each binds its port, waits) --
+    var serverProcs = new List<Process>
+    {
+        ExecBackground("python3", $"{SRV}/srv.py", "7001"),
+        ExecBackground("node", $"{SRV}/srv.js", "7002"),
+        ExecBackground("ruby", $"{SRV}/srv.rb", "7003"),
+        ExecBackground("php", $"{SRV}/srv.php", "7004"),
+        ExecBackground("perl", $"{SRV}/srv.pl", "7005"),
+        ExecBackground("lua5.4", $"{SRV}/srv.lua", "7006"),
+        ExecBackground("Rscript", $"{SRV}/srv.R", "7007"),
+        ExecBackground($"{SBIN}/srv_go", "7008"),
+        ExecBackground($"{SBIN}/srv_rust", "7009"),
+        ExecBackground("java", "-cp", SBIN, "Srv", "7010"),
+        ExecBackground("java", "-jar", $"{SBIN}/srv_kt.jar", "7011"),
+        ExecBackground($"{SBIN}/srv_dart", "7012"),
+        ExecBackground("julia", $"{SRV}/srv.jl", "7013"),
+        ExecBackground("node", $"{SBIN}/srv.js", "7014"),   // typescript (tsc-compiled)
+        ExecBackground($"{SBIN}/srv_c", "7015"),
+        ExecBackground($"{SBIN}/srv_cpp", "7016"),
+        ExecBackground($"{SBIN}/srv_ocaml", "7017"),
+        ExecBackground("swift", $"{SRV}/srv.swift", "7018"),
+    };
+
+    // ---- Run each language's [cli] line in TIOBE order (27 languages) --------
+    (string lang, string[] argv)[] cliJobs =
+    {
+        ("python",     new[]{"python3", $"{HELLO}/hello.py"}),
+        ("c",          new[]{$"{BIN}/hello_c"}),
+        ("c++",        new[]{$"{BIN}/hello_cpp"}),
+        ("java",       new[]{"java", $"{HELLO}/hello.java"}),
+        ("javascript", new[]{"node", $"{HELLO}/hello.js"}),
+        ("r",          new[]{"Rscript", $"{HELLO}/hello.R"}),
+        ("rust",       new[]{$"{BIN}/hello_rust"}),
+        ("go",         new[]{$"{BIN}/hello_go"}),
+        ("php",        new[]{"php", $"{HELLO}/hello.php"}),
+        ("swift",      new[]{"swift", $"{HELLO}/hello.swift"}),
+        ("ada",        new[]{$"{BIN}/hello_ada"}),
+        ("assembly",   new[]{$"{BIN}/hello_asm"}),
+        ("fortran",    new[]{$"{BIN}/hello_fortran"}),
+        ("ruby",       new[]{"ruby", $"{HELLO}/hello.rb"}),
+        ("perl",       new[]{"perl", $"{HELLO}/hello.pl"}),
+        ("cobol",      new[]{$"{BIN}/hello_cobol"}),
+        ("prolog",     new[]{"swipl", "-q", $"{HELLO}/hello_prolog.pl"}),
+        ("julia",      new[]{"julia", $"{HELLO}/hello.jl"}),
+        ("kotlin",     new[]{"java", "-jar", $"{BIN}/hello_kt.jar"}),
+        ("dart",       new[]{"dart", $"{HELLO}/hello.dart"}),
+        ("lisp",       new[]{"sbcl", "--script", $"{HELLO}/hello.lisp"}),
+        ("lua",        new[]{"lua5.4", $"{HELLO}/hello.lua"}),
+        ("ocaml",      new[]{$"{BIN}/hello_ocaml"}),
+        ("haskell",    new[]{$"{BIN}/hello_haskell"}),
+        ("typescript", new[]{"node", $"{BIN}/hello_ts.js"}),
+        ("zig",        new[]{$"{BIN}/hello_zig"}),
+        ("bash",       new[]{"bash", $"{HELLO}/hello.sh"}),
+    };
+    foreach (var (lang, argv) in cliJobs)
+    {
+        string outText = await ExecCaptureAsync(lang, argv);
+        Console.WriteLine($"[cli] {outText}");
+    }
+    Console.WriteLine("all [cli] languages OK");
 
     // Per-language TCP handshake: connect SEQUENTIALLY to each mapped server
     // port, send "send", read the hello, send "ack" (server then exits), print
@@ -118,41 +216,46 @@ try
         ("java",7010),("kotlin",7011),("dart",7012),("julia",7013),
         ("typescript",7014),("c",7015),("c++",7016),("ocaml",7017),("swift",7018),
     };
-    var tcpWork = Task.Run(async () =>
+    foreach (var (lang, port) in servers)
     {
-        foreach (var (lang, port) in servers)
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(120);
+        string? hello = null;
+        while (hello is null && DateTime.UtcNow < deadline && !tcpCts.IsCancellationRequested)
         {
-            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(120);
-            string? hello = null;
-            while (hello is null && DateTime.UtcNow < deadline && !tcpCts.IsCancellationRequested)
+            try
             {
-                try
+                using var client = new System.Net.Sockets.TcpClient();
+                await client.ConnectAsync("127.0.0.1", port, tcpCts.Token);
+                var ns = client.GetStream();
+                await ns.WriteAsync(Encoding.UTF8.GetBytes("send\n"), tcpCts.Token);
+                using var reader = new StreamReader(ns);
+                var line = await reader.ReadLineAsync(tcpCts.Token);
+                if (!string.IsNullOrEmpty(line))
                 {
-                    using var client = new System.Net.Sockets.TcpClient();
-                    await client.ConnectAsync("127.0.0.1", port, tcpCts.Token);
-                    var ns = client.GetStream();
-                    await ns.WriteAsync(Encoding.UTF8.GetBytes("send\n"), tcpCts.Token);
-                    using var reader = new StreamReader(ns);
-                    var line = await reader.ReadLineAsync(tcpCts.Token);
-                    if (!string.IsNullOrEmpty(line))
-                    {
-                        await ns.WriteAsync(Encoding.UTF8.GetBytes("ack\n"), tcpCts.Token);
-                        hello = line;                    // full handshake done
-                    }
+                    await ns.WriteAsync(Encoding.UTF8.GetBytes("ack\n"), tcpCts.Token);
+                    hello = line;                    // full handshake done
                 }
-                catch (OperationCanceledException) { return; }
-                catch { try { await Task.Delay(1000, tcpCts.Token); } catch (OperationCanceledException) { return; } }
             }
-            if (hello is not null) Console.WriteLine($"[tcp] {hello}");
-            else Console.Error.WriteLine($"[tcp] FAILED to handshake [{lang}] on port {port}");
+            catch (OperationCanceledException) { break; }
+            catch { try { await Task.Delay(1000, tcpCts.Token); } catch (OperationCanceledException) { break; } }
         }
-    });
+        if (hello is not null) Console.WriteLine($"[tcp] {hello}");
+        else { Console.Error.WriteLine($"[tcp] FAILED to handshake [{lang}] on port {port}"); exitCode = 1; }
+    }
 
-    exitCode = await done.Task;                // run-all.sh exit code (non-zero = fail-fast)
-    Console.WriteLine($"[done] run-all.sh exited code={exitCode}");
-
-    // give the handshake loop a moment to finish any final [tcp] line, then stop it
-    await Task.WhenAny(tcpWork, Task.Delay(5000));
+    // ---- Wait for the 18 servers to finish (each exits after its ack) --------
+    // A server that never got a client would hang; bound the wait so the app
+    // can't stall. Each server exits 0 after the handshake.
+    foreach (var proc in serverProcs)
+    {
+        var exited = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+        proc.Exited += code => exited.TrySetResult(code);
+        // Exited may already have fired before we subscribed; State covers that.
+        if (proc.State == ProcessState.Exited) exited.TrySetResult(proc.ExitCode);
+        await Task.WhenAny(exited.Task, Task.Delay(10000));
+        proc.Dispose();
+    }
+    Console.WriteLine("all servers done");
     tcpCts.Cancel();
 }
 catch (Exception ex)

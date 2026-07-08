@@ -49,8 +49,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && ln -s /opt/swift/bin/swift /usr/local/bin/swift && rm /tmp/swift.tar.gz
 
 COPY hello/ /app/hello/
-COPY run-all.sh /app/run-all.sh
-RUN chmod +x /app/run-all.sh
 
 # Compile the compiled languages into /app/bin (runtime just executes these).
 RUN mkdir -p /app/bin \
@@ -83,4 +81,7 @@ RUN mkdir -p /app/servers/bin \
  && tsc --outDir /app/servers/bin /app/servers/srv.ts \
  && (cd /app/servers && dart compile exe srv.dart -o /app/servers/bin/srv_dart)
 
-CMD ["/app/run-all.sh"]
+# The Windows app drives everything via CreateProcess against a running
+# container, so pid-1 just needs to stay alive. The app overrides this with its
+# own InitProcess (sleep infinity); this CMD is a sane fallback for `wslc run`.
+CMD ["sleep", "infinity"]

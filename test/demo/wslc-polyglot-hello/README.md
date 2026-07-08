@@ -5,8 +5,9 @@ to run **one Debian container** that prints "hello world" in **27 programming
 languages**, in **TIOBE popularity rank order**. It demonstrates **two output
 channels**:
 
-- **`[cli]`** — every language prints its line to the container's **stdout**,
-  which the SDK streams to the Windows console (all 27 languages).
+- **`[cli]`** — the Windows app runs each language's program inside the
+  container via the SDK's `CreateProcess`, captures its stdout, and prints the
+  line (all 27 languages).
 - **`[tcp]`** — **18** of the languages *also* run their own **TCP server**; the
   Windows app connects to each and does a `send`→`hello`→`ack` handshake to get
   its line over a **real socket** (see "Real TCP channel" below).
@@ -18,10 +19,10 @@ So the console shows, per participating language:
 [tcp] hello world from [python]
 ```
 
-The `[cli]` line comes over stdout; the `[tcp]` line is a genuine socket message
-that travelled container → Windows. The 9 languages where a raw socket is
-disproportionate (assembly, cobol, fortran, ada, prolog, lisp, zig, haskell,
-bash) emit `[cli]` only.
+The `[cli]` line is the captured stdout of a `CreateProcess` exec; the `[tcp]`
+line is a genuine socket message that travelled container → Windows. The 9
+languages where a raw socket is disproportionate (assembly, cobol, fortran, ada,
+prolog, lisp, zig, haskell, bash) emit `[cli]` only.
 
 The 27 languages are built into one image via the SDK's `WslcImage` build
 targets (`wslc image build` at `dotnet build` time). Compiled languages
@@ -59,30 +60,53 @@ are roughly 7 GB).
 dotnet run --project test/demo/wslc-polyglot-hello/app/WslcPolyglotHello.csproj -c Debug
 ```
 
-The app loads `polyglot.tar`, starts the container, streams its stdout (the
-`[cli]` lines), and handshakes with each language's TCP server to get the
-`[tcp]` lines. You get 27 `[cli]` lines (all languages) and 18 `[tcp]` lines (the
-languages with a TCP server), for example:
+The app loads `polyglot.tar`, starts the container (whose pid-1 is just
+`sleep infinity`), then **orchestrates everything from C#**: it runs each
+language's program via `CreateProcess` for the `[cli]` lines, and handshakes
+with each language's TCP server for the `[tcp]` lines. You get 27 `[cli]` lines
+(all languages) and 18 `[tcp]` lines (the languages with a TCP server), for
+example:
 
 ```
 [cli] hello world from [python]
-[tcp] hello world from [python]
 [cli] hello world from [c]
-[tcp] hello world from [c]
 [cli] hello world from [assembly]     # cli only — no [tcp] for skip-group
 ...
 [cli] hello world from [bash]
-[done] run-all.sh exited code=0
+all [cli] languages OK
+[tcp] hello world from [python]
+[tcp] hello world from [c]
+...
+all servers done
 ```
 
 > **The `[tcp]` lines can take up to ~1 minute to appear.** The container's TCP
-> port is exposed to Windows via the SDK's port mapping, which in this WSL
-> version can take ~30–55 s to become stably reachable. The app keeps retrying
-> and the container waits for delivery, so a full run may take a couple of
-> minutes. `[cli]` lines appear immediately; `[tcp]` lines arrive once the
-> mapping is up.
+> ports are exposed to Windows via the SDK's port mappings, which in this WSL
+> version can take ~30–55 s each to become stably reachable. The app keeps
+> retrying, so a full run may take a couple of minutes. The `[cli]` lines (the
+> `CreateProcess` execs) finish quickly; the `[tcp]` lines arrive once the
+> mappings are up.
 
 On exit the container + session are torn down; re-runs start clean.
+
+## Orchestration (no in-container script)
+
+There is **no `run-all.sh`** — the Windows app drives the whole sequence from C#
+against a running container:
+
+- The container's **pid-1 is `sleep infinity`** (`Program.cs` sets `InitProcess`
+  to it; the image `CMD` is the same as a fallback for `wslc run`). It exists
+  only to keep the container alive.
+- For each of the 27 `[cli]` languages, the app calls **`container.CreateProcess`**
+  with that language's command, captures the process's stdout via the
+  `OutputReceived` event, asserts it is non-empty, and prints `[cli] …`. A
+  non-zero exit or empty output aborts the run (fail-fast).
+- The 18 TCP servers are launched the same way (`CreateProcess`, in the
+  background), then the app performs the handshakes and waits for each server to
+  exit.
+
+This keeps all control flow — ordering, fail-fast, timeouts — in the debuggable
+Windows process instead of a shell script inside the container.
 
 ## Real TCP channel
 
@@ -123,9 +147,9 @@ container.)
 the WSLC port-proxy may accept+immediately-close a port before its server is
 listening (so the app retries each port until the *full* handshake completes),
 and Windows connects **sequentially** — so a full run can take **several
-minutes**. `run-all.sh` launches all 18 servers in the background and `wait`s for
-them (each exits after its ack), with a bounded overall timeout so nothing hangs
-forever.
+minutes**. The app launches all 18 servers in the background (via
+`CreateProcess`) and, after the handshakes, waits for each to exit (each exits
+after its ack), with a bounded overall timeout so nothing hangs forever.
 
 ### Port assignment
 
@@ -202,10 +226,11 @@ tarball), Kotlin (JetBrains GitHub release), Dart (Google apt repo).
 - **Restore 401 / package not found:** fix the `wslc-local` source in `nuget.config`.
 - **`error CS1705`:** bump `<WindowsSdkPackageVersion>`.
 - **Platform error about x64/arm64:** build x64 (the csproj pins it).
-- **A language failed → the run aborts (fail-fast):** read the last
-  `run-all: FAILED at [<lang>]` line on stderr and the exit code. A TCP server
-  that crashes or never gets its client aborts with
-  `run-all: FAILED: server pid <n> ...`.
+- **A language failed → the run aborts (fail-fast):** the app throws when a
+  `[cli]` exec exits non-zero or produces no output — read the `[<lang>] exited
+  <code>` / `[<lang>] produced no output` message and the process exit code. A
+  TCP server that never gets its client is bounded by the per-port timeout and
+  reported as `[tcp] FAILED to handshake [<lang>]`.
 - **No `[tcp]` lines appear:** the SDK port mappings (`localhost:7001–7018`) may
   not have become reachable — each can take ~30–55 s in this WSL version, and the
   app retries each port for ~120 s. Confirm nothing else on Windows holds ports

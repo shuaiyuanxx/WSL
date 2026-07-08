@@ -5,10 +5,12 @@ WORKDIR /app
 # apt-installable toolchains (validated on debian:stable-slim). Includes the
 # apt-provided new languages: sbcl (Lisp), node-typescript (TypeScript, provides
 # `tsc`), plus curl/unzip/gnupg used to fetch the non-apt toolchains below.
+# ghc (Haskell) and zig are NOT installed here — they are build-only compilers
+# installed+used+purged within a single RUN below so they never bloat the image.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 default-jdk nodejs r-base rustc golang php-cli ruby perl \
         swi-prolog lua5.4 \
-        gcc g++ gfortran gnat gnucobol ocaml-nox ghc binutils libc6-dev \
+        gcc g++ gfortran gnat gnucobol ocaml-nox binutils libc6-dev \
         sbcl node-typescript lua-socket \
         curl unzip xz-utils gnupg apt-transport-https ca-certificates \
  && rm -rf /var/lib/apt/lists/*
@@ -24,10 +26,8 @@ RUN curl -fsSL https://dl-ssl.google.com/linux/linux_signing_key.pub \
  && rm -rf /var/lib/apt/lists/*
 ENV PATH="/usr/lib/dart/bin:${PATH}"
 
-# Zig via official tarball (not in Debian apt).
-RUN curl -fsSL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz -o /tmp/zig.tar.xz \
- && mkdir -p /opt/zig && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 \
- && ln -s /opt/zig/zig /usr/local/bin/zig && rm /tmp/zig.tar.xz
+# (Zig is fetched, used, and deleted inside the hello_zig compile RUN below so
+# its ~340 MB never lands in a persistent layer.)
 
 # Julia via official tarball (1.11+ — 1.10 fails with an execstack error in this runtime).
 RUN curl -fsSL https://julialang-s3.julialang.org/bin/linux/x64/1.11/julia-1.11.5-linux-x86_64.tar.gz -o /tmp/julia.tar.gz \
@@ -61,10 +61,25 @@ RUN mkdir -p /app/bin \
  && gfortran -O2 -o /app/bin/hello_fortran  /app/hello/hello.f90 \
  && cobc -x -o /app/bin/hello_cobol /app/hello/hello.cob \
  && ocamlopt -o /app/bin/hello_ocaml /app/hello/hello.ml \
- && ghc -o /app/bin/hello_haskell /app/hello/hello.hs -outputdir /tmp/ghc \
- && zig build-exe /app/hello/hello.zig -femit-bin=/app/bin/hello_zig -O ReleaseSafe \
  && kotlinc /app/hello/Hello.kt -include-runtime -d /app/bin/hello_kt.jar \
  && tsc --outFile /app/bin/hello_ts.js /app/hello/hello.ts
+
+# Haskell: install ghc, compile the static binary, then purge ghc — all in one
+# RUN so the ~700 MB compiler never persists in a layer. The GHC-compiled binary
+# still dynamically links libnuma.so.1 (a tiny runtime lib pulled in by ghc), so
+# reinstall just libnuma1 after purging ghc or the binary won't load.
+RUN apt-get update && apt-get install -y --no-install-recommends ghc \
+ && ghc -o /app/bin/hello_haskell /app/hello/hello.hs -outputdir /tmp/ghc \
+ && apt-get purge -y ghc && apt-get autoremove -y \
+ && apt-get install -y --no-install-recommends libnuma1 \
+ && rm -rf /var/lib/apt/lists/* /tmp/ghc
+
+# Zig: fetch the toolchain, compile the static binary, then delete it — all in
+# one RUN so the ~340 MB toolchain never persists in a layer.
+RUN curl -fsSL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz -o /tmp/zig.tar.xz \
+ && mkdir -p /opt/zig && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 \
+ && /opt/zig/zig build-exe /app/hello/hello.zig -femit-bin=/app/bin/hello_zig -O ReleaseSafe \
+ && rm -rf /opt/zig /tmp/zig.tar.xz
 
 COPY servers/ /app/servers/
 

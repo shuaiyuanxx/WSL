@@ -37,8 +37,8 @@ into the image; interpreted ones run at container start.
   (`C:\Program Files\WSL`) — the build invokes it. Version must match the SDK
   package (2.9.3), else a runtime SDK call throws `AccessViolationException`.
 - **.NET 8 SDK**.
-- The `Microsoft.WSL.Containers` `.nupkg` in the folder referenced by
-  `nuget.config` (`wslc-local`).
+- The `Microsoft.WSL.Containers` package — restored automatically from public
+  NuGet.org (no manual setup needed).
 - No Docker required — the image is built via `wslc image build`.
 
 ## Build it (builds the polyglot image)
@@ -223,7 +223,8 @@ tarball), Kotlin (JetBrains GitHub release), Dart (Google apt repo).
 
 - **`WSLC0001` (`wslc --version` failed during build):** `wslc` not on MSBuild's
   PATH. Ensure `C:\Program Files\WSL` is on PATH, or the csproj's `<WslcCliPath>`.
-- **Restore 401 / package not found:** fix the `wslc-local` source in `nuget.config`.
+- **Restore fails / package not found:** ensure network access to
+  nuget.org, and that the package version in the csproj matches your `wslc version`.
 - **`error CS1705`:** bump `<WindowsSdkPackageVersion>`.
 - **Platform error about x64/arm64:** build x64 (the csproj pins it).
 - **A language failed → the run aborts (fail-fast):** the app throws when a

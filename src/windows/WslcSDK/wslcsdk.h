@@ -75,6 +75,7 @@ typedef struct WslcProcessSettings
 } WslcProcessSettings;
 
 DECLARE_HANDLE(WslcProcess);
+DECLARE_HANDLE(WslcDebugTransport);
 
 typedef enum WslcContainerNetworkingMode
 {
@@ -235,6 +236,11 @@ STDAPI WslcStartContainer(_In_ WslcContainer container, _In_ WslcContainerStartF
 STDAPI WslcSetContainerSettingsName(_In_ WslcContainerSettings* containerSettings, _In_ PCSTR name);
 
 STDAPI WslcSetContainerSettingsInitProcess(_In_ WslcContainerSettings* containerSettings, _In_ WslcProcessSettings* initProcess);
+
+// Enables standard input attachment for the container init process. The container must
+// be started with WSLC_CONTAINER_START_FLAG_ATTACH before stdin can be acquired through
+// WslcGetProcessIOHandle.
+STDAPI WslcSetContainerSettingsInitProcessStandardInput(_In_ WslcContainerSettings* containerSettings, _In_ BOOL enabled);
 
 STDAPI WslcSetContainerSettingsNetworkingMode(_In_ WslcContainerSettings* containerSettings, _In_ WslcContainerNetworkingMode networkingMode);
 
@@ -423,6 +429,20 @@ STDAPI WslcSignalProcess(_In_ WslcProcess process, _In_ WslcSignal signal);
 STDAPI WslcGetProcessIOHandle(_In_ WslcProcess process, _In_ WslcProcessIOHandle ioHandle, _Out_ HANDLE* handle);
 
 STDAPI WslcReleaseProcess(_In_ WslcProcess process);
+
+// Starts a local, single-client debug transport that relays an authenticated named pipe
+// to the process standard input and output streams. The process must have stdin enabled
+// and must have been started with WSLC_CONTAINER_START_FLAG_ATTACH.
+STDAPI WslcCreateProcessDebugTransport(
+    _In_ WslcProcess process,
+    _In_ PCWSTR pipeName,
+    _In_ PCWSTR capabilityToken,
+    _In_ PCWSTR correlationId,
+    _In_ PCWSTR providerId,
+    _Out_ WslcDebugTransport* transport,
+    _Outptr_opt_result_z_ PWSTR* errorMessage);
+
+STDAPI WslcReleaseDebugTransport(_In_ WslcDebugTransport transport);
 
 // IMAGE MANAGEMENT
 

@@ -18,6 +18,7 @@ Abstract:
 #include "Defaults.h"
 #include "ProgressCallback.h"
 #include "CrashDumpCallback.h"
+#include "DebugTransport.h"
 #include "install.h"
 #include "Localization.h"
 #include "WslInstall.h"
@@ -782,6 +783,10 @@ try
     containerOptions.Flags = ConvertFlags(internalContainerSettings->containerFlags);
 
     CopyProcessSettingsToRuntime(containerOptions.InitProcessOptions, internalContainerSettings->initProcessOptions);
+    WI_SetFlagIf(
+        containerOptions.InitProcessOptions.Flags,
+        WSLCProcessFlagsStdin,
+        internalContainerSettings->initProcessStandardInput);
 
     std::unique_ptr<WSLCCompatVolume[]> convertedVolumes;
     if (internalContainerSettings->volumes && internalContainerSettings->volumesCount)
@@ -986,6 +991,15 @@ try
 
     internalType->initProcessOptions = GetInternalType(initProcess);
 
+    return S_OK;
+}
+CATCH_RETURN();
+
+STDAPI WslcSetContainerSettingsInitProcessStandardInput(_In_ WslcContainerSettings* containerSettings, _In_ BOOL enabled)
+try
+{
+    auto internalType = CheckAndGetInternalType(containerSettings);
+    internalType->initProcessStandardInput = enabled != FALSE;
     return S_OK;
 }
 CATCH_RETURN();
@@ -1376,6 +1390,60 @@ try
     auto result = IOCallback::GetIOHandle(internalType->process.get(), ioHandle);
     *handle = result.release();
 
+    return S_OK;
+}
+CATCH_RETURN();
+
+STDAPI WslcCreateProcessDebugTransport(
+    _In_ WslcProcess process,
+    _In_ PCWSTR pipeName,
+    _In_ PCWSTR capabilityToken,
+    _In_ PCWSTR correlationId,
+    _In_ PCWSTR providerId,
+    _Out_ WslcDebugTransport* transport,
+    _Outptr_opt_result_z_ PWSTR* errorMessage)
+try
+{
+    RETURN_HR_IF_NULL(E_POINTER, transport);
+    *transport = nullptr;
+    ErrorInfoWrapper errorInfoWrapper{errorMessage};
+
+    auto internalType = CheckAndGetInternalType(process);
+    RETURN_HR_IF_NULL(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), internalType->process);
+
+    auto standardInput = IOCallback::GetIOHandle(internalType->process.get(), WSLC_PROCESS_IO_HANDLE_STDIN);
+    auto standardOutput = IOCallback::GetIOHandle(internalType->process.get(), WSLC_PROCESS_IO_HANDLE_STDOUT);
+
+    wil::unique_handle standardError;
+    try
+    {
+        standardError = IOCallback::GetIOHandle(internalType->process.get(), WSLC_PROCESS_IO_HANDLE_STDERR);
+    }
+    CATCH_LOG();
+
+    HANDLE borrowedProcessExitEvent{};
+    RETURN_IF_FAILED(errorInfoWrapper.CaptureResult(internalType->process->GetExitEvent(&borrowedProcessExitEvent)));
+    wil::unique_handle processExitEvent{DuplicateHandle(borrowedProcessExitEvent)};
+
+    auto result = std::make_unique<WslcDebugTransportImpl>(
+        std::move(standardInput),
+        std::move(standardOutput),
+        std::move(standardError),
+        std::move(processExitEvent),
+        pipeName,
+        capabilityToken,
+        correlationId,
+        providerId);
+
+    *transport = reinterpret_cast<WslcDebugTransport>(result.release());
+    return S_OK;
+}
+CATCH_RETURN();
+
+STDAPI WslcReleaseDebugTransport(_In_ WslcDebugTransport transport)
+try
+{
+    auto internalType = CheckAndGetInternalTypeUniquePointer(transport);
     return S_OK;
 }
 CATCH_RETURN();

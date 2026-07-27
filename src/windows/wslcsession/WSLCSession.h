@@ -16,6 +16,7 @@ Abstract:
 
 #include "wslc.h"
 #include "WSLCCompat.h"
+#include "WSLCDebugPolicy.h"
 #include "WSLCVirtualMachine.h"
 #include "WSLCContainer.h"
 #include "WSLCVolumes.h"
@@ -332,6 +333,13 @@ private:
     WSLCFeatureFlags m_featureFlags{};
     std::function<void()> m_destructionCallback;
     std::atomic<bool> m_terminating{false};
+
+    // Owned copy of the narrow debug policy propagated from the service when a debug
+    // intent was claimed during CreateSession. Null for ordinary sessions. Set once in
+    // Initialize() (before the session is returned to any caller) and consumed at most
+    // once by the first matching CreateContainer. Access under m_containersLock, which
+    // also serializes container creation.
+    std::unique_ptr<WSLCDebugPolicyOwned> m_debugPolicy;
 
     wil::com_ptr<IWSLCPluginNotifier> m_pluginNotifier;
 

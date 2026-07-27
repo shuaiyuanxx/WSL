@@ -28,6 +28,7 @@ Abstract:
 --*/
 
 #include "WSLCSessionManager.h"
+#include "WSLCDebugIntentManager.h"
 #include "HcsVirtualMachine.h"
 #include "WSLCUserSettings.h"
 #include "WSLCSessionDefaults.h"
@@ -252,6 +253,14 @@ void WSLCSessionManagerImpl::CreateSession(
 
     std::wstring callerFileName;
 
+    // Debug policy backing storage. Declared here (outside the lambda) so that,
+    // when a debug intent is claimed, the WSLCDebugPolicy pointers we hand to the
+    // synchronous factory->CreateSession marshaling remain valid for the whole
+    // call. Empty for ordinary sessions.
+    std::optional<wsl::windows::service::wslc::DebugPolicyStorage> claimedPolicy;
+    WSLCDebugPolicy debugPolicy{};
+    auto clearMarshaledToken = wil::scope_exit([&]() { SecureZeroMemory(debugPolicy.Token, sizeof(debugPolicy.Token)); });
+
     HRESULT creationResult = wil::ResultFromException([&]() {
         // Get caller info.
         const auto callerProcess = wslutil::OpenCallingProcess(PROCESS_QUERY_LIMITED_INFORMATION);
@@ -266,6 +275,39 @@ void WSLCSessionManagerImpl::CreateSession(
         }
 
         const auto userToken = wsl::windows::common::security::GetUserToken(TokenImpersonation);
+
+        // Debug Intent claim: build the authoritative caller identity from the
+        // process we just opened (SID from the impersonated token, PID/creation
+        // time/image from the process handle) and try to claim a matching intent.
+        // No-match returns nullopt and preserves ordinary behavior exactly.
+        {
+            wsl::windows::service::wslc::DebugCallerIdentity claimIdentity;
+            const DWORD claimSidLen = GetLengthSid(tokenInfo.TokenInfo->User.Sid);
+            claimIdentity.Sid.resize(claimSidLen);
+            THROW_IF_WIN32_BOOL_FALSE(CopySid(claimSidLen, claimIdentity.Sid.data(), tokenInfo.TokenInfo->User.Sid));
+            claimIdentity.Elevated = tokenInfo.Elevated;
+            claimIdentity.Pid = creatorPid;
+            FILETIME creation{}, exitTime{}, kernelTime{}, userTime{};
+            if (GetProcessTimes(callerProcess.get(), &creation, &exitTime, &kernelTime, &userTime))
+            {
+                claimIdentity.ProcessCreationTime = creation;
+            }
+            if (!callerFilePath.empty())
+            {
+                auto lowerPath = callerFilePath;
+                std::ranges::transform(lowerPath, lowerPath.begin(), [](wchar_t c) { return static_cast<wchar_t>(towlower(c)); });
+                claimIdentity.ImageFilePath = lowerPath;
+                auto lowerName = std::filesystem::path(callerFilePath).filename().wstring();
+                std::ranges::transform(lowerName, lowerName.begin(), [](wchar_t c) { return static_cast<wchar_t>(towlower(c)); });
+                claimIdentity.ImageFileName = lowerName;
+            }
+
+            claimedPolicy = wsl::windows::service::wslc::WSLCDebugIntentManagerImpl::Instance().TryClaimForCaller(claimIdentity);
+            if (claimedPolicy.has_value())
+            {
+                claimedPolicy->Fill(debugPolicy);
+            }
+        }
 
         // Capture a duplicated user token + raw SID so PluginManager can build
         // WSLCSessionInformation later (e.g. on shutdown) without re-impersonating.
@@ -293,7 +335,8 @@ void WSLCSessionManagerImpl::CreateSession(
         auto factory = wslutil::CreateComServerAsUser<IWSLCSessionFactory>(__uuidof(WSLCSessionFactory), userToken.get());
         wil::unique_handle sessionJob = CreateSessionProcessJob(factory.get());
 
-        const auto sessionSettings = CreateSessionSettings(sessionId, callerFileName.c_str(), Settings, resolvedDisplayName.c_str());
+        const auto sessionSettings = CreateSessionSettings(
+            sessionId, callerFileName.c_str(), Settings, resolvedDisplayName.c_str(), claimedPolicy.has_value() ? &debugPolicy : nullptr);
         wil::com_ptr<IWSLCSession> session;
         wil::com_ptr<IWSLCSessionReference> serviceRef;
         const auto factoryHr =
@@ -311,6 +354,13 @@ void WSLCSessionManagerImpl::CreateSession(
         // Track the session via its service ref, along with metadata and security info.
         m_sessions.push_back(SessionEntry{
             std::move(serviceRef), sessionId, creatorPid, resolvedDisplayName, std::move(tokenInfo), notifier, false, sharedToken, std::move(storedSid), std::move(sessionJob)});
+
+        // Record debug-intent lifecycle metadata (intent id only; never the token).
+        if (claimedPolicy.has_value())
+        {
+            m_sessions.back().HasDebugIntent = true;
+            m_sessions.back().DebugIntentId = claimedPolicy->IntentId;
+        }
 
         // For persistent sessions, also hold a strong reference to keep them alive.
         const bool persistent = WI_IsFlagSet(Flags, WSLCSessionFlagsPersistent);
@@ -459,7 +509,11 @@ void WSLCSessionManagerImpl::EnterSession(
 }
 
 WSLCSessionInitSettings WSLCSessionManagerImpl::CreateSessionSettings(
-    _In_ ULONG SessionId, _In_ LPCWSTR CreatorProcessName, _In_ const WSLCSessionSettings* Settings, _In_ LPCWSTR ResolvedDisplayName)
+    _In_ ULONG SessionId,
+    _In_ LPCWSTR CreatorProcessName,
+    _In_ const WSLCSessionSettings* Settings,
+    _In_ LPCWSTR ResolvedDisplayName,
+    _In_opt_ const WSLCDebugPolicy* DebugPolicy)
 {
     WSLCSessionInitSettings sessionSettings{};
     sessionSettings.SessionId = SessionId;
@@ -473,6 +527,10 @@ WSLCSessionInitSettings WSLCSessionManagerImpl::CreateSessionSettings(
     sessionSettings.RootVhdTypeOverride = Settings->RootVhdTypeOverride;
     sessionSettings.StorageFlags = Settings->StorageFlags;
     sessionSettings.SwapSizeMb = Settings->MemoryMb;
+    // Narrow, immutable internal debug policy. NULL for ordinary sessions. When
+    // present, the pointee's backing storage is owned by the CreateSession caller
+    // (a stack local) and outlives the synchronous factory->CreateSession call.
+    sessionSettings.DebugPolicy = DebugPolicy;
     return sessionSettings;
 }
 
@@ -632,8 +690,35 @@ HRESULT WSLCSessionManager::OpenSessionByName(_In_ LPCWSTR DisplayName, _Out_ IW
 
 HRESULT WSLCSessionManager::InterfaceSupportsErrorInfo(_In_ REFIID riid)
 {
-    return riid == __uuidof(IWSLCSessionManager) ? S_OK : S_FALSE;
+    return (riid == __uuidof(IWSLCSessionManager) || riid == __uuidof(IWSLCDebugIntentManager)) ? S_OK : S_FALSE;
 }
+
+HRESULT WSLCSessionManager::RegisterDebugIntent(_In_ const WSLCDebugIntentRequest* Request, _Out_ WSLCDebugIntentResult* Result)
+try
+{
+    COMServiceExecutionContext context;
+    wsl::windows::service::wslc::WSLCDebugIntentManagerImpl::Instance().RegisterDebugIntent(Request, Result);
+    return S_OK;
+}
+CATCH_RETURN();
+
+HRESULT WSLCSessionManager::CancelDebugIntent(_In_ REFGUID IntentId)
+try
+{
+    COMServiceExecutionContext context;
+    wsl::windows::service::wslc::WSLCDebugIntentManagerImpl::Instance().CancelDebugIntent(IntentId);
+    return S_OK;
+}
+CATCH_RETURN();
+
+HRESULT WSLCSessionManager::GetDebugIntentState(_In_ REFGUID IntentId, _Out_ WSLCDebugIntentState* State)
+try
+{
+    COMServiceExecutionContext context;
+    wsl::windows::service::wslc::WSLCDebugIntentManagerImpl::Instance().GetDebugIntentState(IntentId, State);
+    return S_OK;
+}
+CATCH_RETURN();
 
 HRESULT WSLCSessionManager::GetVersion(_Out_ WSLCCompatVersion* Version)
 try

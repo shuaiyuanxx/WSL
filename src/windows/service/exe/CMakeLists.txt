@@ -23,6 +23,7 @@ set(SOURCES
     HcsVirtualMachine.cpp
     WSLCSessionManager.cpp
     WSLCSessionManagerFactory.cpp
+    WSLCDebugIntentManager.cpp
     WSLCPluginNotifier.cpp
     main.rc
     ${CMAKE_CURRENT_BINARY_DIR}/../mc/${TARGET_PLATFORM}/${CMAKE_BUILD_TYPE}/wsleventschema.rc
@@ -55,6 +56,7 @@ set(HEADERS
     HcsVirtualMachine.h
     WSLCSessionManager.h
     WSLCSessionManagerFactory.h
+    WSLCDebugIntentManager.h
     WSLCPluginNotifier.h)
 
 add_executable(wslservice ${SOURCES} ${HEADERS})

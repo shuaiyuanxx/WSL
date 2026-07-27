@@ -322,6 +322,7 @@
                     <!-- O:BAG:BAD:(A;;CCDCSW;;;AU)(A;;CCDCSW;;;PS)(A;;CCDCSW;;;SY) -->
                     <RegistryValue Name="AccessPermission" Value="${DCOM_PERMISSION}" Type="binary" />
                     <RegistryValue Name="LaunchPermission" Value="${DCOM_PERMISSION}" Type="binary" />
+                    <RegistryValue Name="RunAs" Value="Interactive User" Type="string" />
                 </RegistryKey>
                 <RegistryKey Root="HKCR" Key="CLSID\{9FCD2067-9FC6-4EFA-9EB0-698169EBF7D3}">
                     <RegistryValue Name="AppId" Value="{1FAB86C3-F4DF-4271-8E63-6F071C4F708A}" Type="string" />

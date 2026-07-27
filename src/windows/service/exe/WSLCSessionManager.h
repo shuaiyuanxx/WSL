@@ -71,6 +71,14 @@ struct SessionEntry
     std::vector<BYTE> UserSid;
 
     wil::unique_handle JobObject;
+
+    // Debug Intent lifecycle metadata. Set only when a debug intent was claimed
+    // during CreateSession. We deliberately store just the intent id (for
+    // correlation/cleanup) here; the secret token lives only in the transient
+    // policy storage propagated to the per-user process and is never retained in
+    // service-side tracking or telemetry. HasDebugIntent gates cleanup.
+    bool HasDebugIntent = false;
+    GUID DebugIntentId{};
 };
 
 class WSLCSessionManagerImpl
@@ -168,7 +176,11 @@ private:
 
     [[nodiscard]] wil::unique_handle CreateSessionProcessJob(_In_ IWSLCSessionFactory* Factory);
     WSLCSessionInitSettings CreateSessionSettings(
-        _In_ ULONG SessionId, _In_ LPCWSTR CreatorProcessName, _In_ const WSLCSessionSettings* Settings, _In_ LPCWSTR ResolvedDisplayName);
+        _In_ ULONG SessionId,
+        _In_ LPCWSTR CreatorProcessName,
+        _In_ const WSLCSessionSettings* Settings,
+        _In_ LPCWSTR ResolvedDisplayName,
+        _In_opt_ const WSLCDebugPolicy* DebugPolicy);
     static CallingProcessTokenInfo GetCallingProcessTokenInfo();
     static HRESULT CheckTokenAccess(const SessionEntry& Entry, const CallingProcessTokenInfo& TokenInfo);
 
@@ -188,7 +200,7 @@ private:
 } // namespace wsl::windows::service::wslc
 
 class DECLSPEC_UUID("a9b7a1b9-0671-405c-95f1-e0612cb4ce8f") WSLCSessionManager
-    : public Microsoft::WRL::RuntimeClass<Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>, IWSLCSessionManager, IWSLCCompatSessionManager, IFastRundown, ISupportErrorInfo>,
+    : public Microsoft::WRL::RuntimeClass<Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>, IWSLCSessionManager, IWSLCDebugIntentManager, IWSLCCompatSessionManager, IFastRundown, ISupportErrorInfo>,
       public wsl::windows::service::wslc::COMImplClass<wsl::windows::service::wslc::WSLCSessionManagerImpl>
 {
 public:
@@ -204,6 +216,13 @@ public:
     IFACEMETHOD(ListSessions)(_Out_ WSLCSessionListEntry** Sessions, _Out_ ULONG* SessionsCount) override;
     IFACEMETHOD(OpenSession)(_In_ ULONG Id, _Out_ IWSLCSession** Session) override;
     IFACEMETHOD(OpenSessionByName)(_In_ LPCWSTR DisplayName, _Out_ IWSLCSession** Session) override;
+
+    // IWSLCDebugIntentManager: independent Debug Intent control plane, exposed on
+    // this coclass without touching the IWSLCSessionManager vtable. Delegates to
+    // the process-wide WSLCDebugIntentManagerImpl singleton.
+    IFACEMETHOD(RegisterDebugIntent)(_In_ const WSLCDebugIntentRequest* Request, _Out_ WSLCDebugIntentResult* Result) override;
+    IFACEMETHOD(CancelDebugIntent)(_In_ REFGUID IntentId) override;
+    IFACEMETHOD(GetDebugIntentState)(_In_ REFGUID IntentId, _Out_ WSLCDebugIntentState* State) override;
 
     // ISupportErrorInfo: enables IErrorInfo marshaling across COM boundaries.
     IFACEMETHOD(InterfaceSupportsErrorInfo)(_In_ REFIID riid) override;

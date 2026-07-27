@@ -79,3 +79,5 @@ test-output*.txt
 test-results.txt
 testfile.txt
 output/
+/src/windows/wslcdebugintent/wslcdebugintent.obj
+/src/windows/wslcdebugintent/wslcdebugintent_probe.exe

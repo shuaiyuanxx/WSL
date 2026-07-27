@@ -42,11 +42,13 @@ public:
     IFACEMETHOD(GetStdHandle)(_In_ WSLCFD Fd, _Out_ WSLCCompatHandle* Handle) override;
 
     wil::unique_handle GetStdHandle(int Index);
+    void SetDebugTransportOwnsIo() noexcept;
     HANDLE GetExitEvent();
     int GetPid() const;
 
 private:
     WSLCProcessFlags m_flags;
+    bool m_debugTransportOwnsIo{false};
     std::shared_ptr<WSLCProcessControl> m_control;
     std::unique_ptr<WSLCProcessIO> m_io;
 };

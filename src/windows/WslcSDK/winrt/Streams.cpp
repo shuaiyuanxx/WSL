@@ -31,9 +31,10 @@ IAsyncOperationWithProgress<IBuffer, uint32_t> IOHandleInputStream::ReadAsync(IB
         throw winrt::hresult_illegal_method_call(L"Stream is closed");
     }
 
-    if (options != InputStreamOptions::None)
+    if (options != InputStreamOptions::None && options != InputStreamOptions::Partial)
     {
-        throw winrt::hresult_error(HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED), L"Only InputStreamOptions::None is supported");
+        throw winrt::hresult_error(
+            HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED), L"Only InputStreamOptions::None and InputStreamOptions::Partial are supported");
     }
 
     if (buffer == nullptr)
@@ -84,12 +85,20 @@ IAsyncOperationWithProgress<uint32_t, uint32_t> IOHandleOutputStream::WriteAsync
         throw winrt::hresult_illegal_method_call(L"Stream is closed");
     }
 
-    // Move to a background thread, ensuring that this object stays alive until the async operation completes.
+    if (buffer == nullptr)
+    {
+        throw winrt::hresult_error(E_POINTER, L"Buffer cannot be null");
+    }
+
+    // Keep both objects alive after switching threads. The projected method receives the
+    // buffer by reference, which is not safe to access after the first suspension point.
     auto self = get_strong();
+    auto writeBuffer = buffer;
     co_await winrt::resume_background();
 
     DWORD bytesWritten = 0;
-    THROW_IF_WIN32_BOOL_FALSE(WriteFile(self->m_handle.get(), buffer.data(), buffer.Length(), &bytesWritten, nullptr));
+    THROW_IF_WIN32_BOOL_FALSE(
+        WriteFile(self->m_handle.get(), writeBuffer.data(), writeBuffer.Length(), &bytesWritten, nullptr));
 
     co_return bytesWritten;
 }

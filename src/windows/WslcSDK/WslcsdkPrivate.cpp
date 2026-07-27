@@ -54,3 +54,8 @@ WslcProcessImpl* GetInternalType(WslcProcess handle)
 {
     return reinterpret_cast<WslcProcessImpl*>(handle);
 }
+
+WslcDebugTransportImpl* GetInternalType(WslcDebugTransport handle)
+{
+    return reinterpret_cast<WslcDebugTransportImpl*>(handle);
+}

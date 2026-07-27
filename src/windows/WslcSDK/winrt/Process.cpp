@@ -14,6 +14,7 @@ Abstract:
 
 #include "precomp.h"
 #include "Process.h"
+#include "DebugTransport.h"
 #include "Streams.h"
 #include "Microsoft.WSL.Containers.Process.g.cpp"
 
@@ -114,6 +115,29 @@ void Process::Start()
     m_settings = nullptr;
 
     StartWaitingForExit();
+}
+
+winrt::Microsoft::WSL::Containers::DebugTransport Process::CreateDebugTransport(
+    hstring const& pipeName,
+    hstring const& capabilityToken,
+    hstring const& correlationId,
+    hstring const& providerId)
+{
+    EnsureStarted();
+
+    WslcDebugTransport transport{};
+    wil::unique_cotaskmem_string errorMessage;
+    const auto hr = WslcCreateProcessDebugTransport(
+        m_process.get(),
+        pipeName.c_str(),
+        capabilityToken.c_str(),
+        correlationId.c_str(),
+        providerId.c_str(),
+        &transport,
+        errorMessage.put());
+    THROW_MSG_IF_FAILED(hr, errorMessage);
+
+    return winrt::make<implementation::DebugTransport>(transport);
 }
 
 void Process::EnsureStarted() const

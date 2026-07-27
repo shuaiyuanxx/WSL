@@ -1,4 +1,5 @@
 set(SOURCES
+    DebugTransport.cpp
     IOCallback.cpp
     ProgressCallback.cpp
     CrashDumpCallback.cpp
@@ -6,6 +7,7 @@ set(SOURCES
     WslcsdkPrivate.cpp
 )
 set(HEADERS
+    DebugTransport.h
     Defaults.h
     IOCallback.h
     ProgressCallback.h

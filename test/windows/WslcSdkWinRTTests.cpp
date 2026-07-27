@@ -683,6 +683,83 @@ class WslcSdkWinRtTests
         VERIFY_ARE_EQUAL(ReadStream(stderrStream), L"STDERR_TOKEN\n");
     }
 
+    WSLC_TEST_METHOD(ProcessOutputStreamPartialReads)
+    {
+        auto procSettings = WSLCSDK::ProcessSettings();
+        procSettings.CommandLine(winrt::single_threaded_vector<winrt::hstring>({L"/bin/sh", L"-c", L"printf hello"}));
+        procSettings.OutputMode(WSLCSDK::ProcessOutputMode::Stream);
+
+        auto containerSettings = WSLCSDK::ContainerSettings(L"debian:latest");
+        containerSettings.InitProcess(procSettings);
+
+        auto container = m_defaultSession.CreateContainer(containerSettings);
+        auto cleanup = DELETE_CONTAINER_ON_SCOPE_EXIT(container);
+        auto initProcess = container.InitProcess();
+        container.Start();
+
+        auto stdoutStream = initProcess.GetOutputStream(WSLCSDK::ProcessOutputHandle::StandardOutput);
+        Buffer buffer{32};
+        auto result = stdoutStream.ReadAsync(buffer, buffer.Capacity(), InputStreamOptions::Partial).get();
+        VERIFY_ARE_EQUAL(result.Length(), static_cast<uint32_t>(5));
+        VERIFY_ARE_EQUAL(std::string_view(reinterpret_cast<const char*>(result.data()), result.Length()), std::string_view("hello"));
+    }
+
+    WSLC_TEST_METHOD(InitProcessStandardInput)
+    {
+        auto settingsDefaults = WSLCSDK::ContainerSettings(L"debian:latest");
+        VERIFY_IS_FALSE(settingsDefaults.RedirectInitProcessStandardInput());
+        settingsDefaults.RedirectInitProcessStandardInput(true);
+        VERIFY_IS_TRUE(settingsDefaults.RedirectInitProcessStandardInput());
+
+        auto procSettings = WSLCSDK::ProcessSettings();
+        procSettings.CommandLine(winrt::single_threaded_vector<winrt::hstring>(
+            {L"/bin/sh", L"-c", L"IFS= read -r line; printf 'reply:%s\\n' \"$line\""}));
+        procSettings.OutputMode(WSLCSDK::ProcessOutputMode::Stream);
+
+        auto containerSettings = WSLCSDK::ContainerSettings(L"debian:latest");
+        containerSettings.InitProcess(procSettings);
+        containerSettings.RedirectInitProcessStandardInput(true);
+
+        auto container = m_defaultSession.CreateContainer(containerSettings);
+        auto cleanup = DELETE_CONTAINER_ON_SCOPE_EXIT(container);
+        auto initProcess = container.InitProcess();
+        container.Start();
+
+        auto stdinStream = initProcess.GetInputStream();
+        DataWriter writer{stdinStream};
+        writer.UnicodeEncoding(UnicodeEncoding::Utf8);
+        writer.WriteString(L"hello\n");
+        VERIFY_ARE_EQUAL(writer.StoreAsync().get(), static_cast<uint32_t>(6));
+        VERIFY_IS_TRUE(writer.FlushAsync().get());
+        writer.DetachStream();
+        stdinStream.Close();
+
+        auto stdoutStream = initProcess.GetOutputStream(WSLCSDK::ProcessOutputHandle::StandardOutput);
+        VERIFY_ARE_EQUAL(ReadStream(stdoutStream), L"reply:hello\n");
+    }
+
+    WSLC_TEST_METHOD(InitProcessStandardInputImplicitAttach)
+    {
+        auto procSettings = WSLCSDK::ProcessSettings();
+        procSettings.CommandLine(winrt::single_threaded_vector<winrt::hstring>({L"/bin/cat"}));
+
+        auto containerSettings = WSLCSDK::ContainerSettings(L"debian:latest");
+        containerSettings.InitProcess(procSettings);
+        containerSettings.RedirectInitProcessStandardInput(true);
+
+        auto container = m_defaultSession.CreateContainer(containerSettings);
+        auto cleanup = DELETE_CONTAINER_ON_SCOPE_EXIT(container);
+        auto initProcess = container.InitProcess();
+        container.Start();
+
+        auto stdinStream = initProcess.GetInputStream();
+        DataWriter writer{stdinStream};
+        writer.WriteString(L"hello\n");
+        VERIFY_ARE_EQUAL(writer.StoreAsync().get(), static_cast<uint32_t>(6));
+        writer.DetachStream();
+        stdinStream.Close();
+    }
+
     WSLC_TEST_METHOD(ContainerNetworkingMode)
     {
         // BRIDGED: eth0 interface must be present.

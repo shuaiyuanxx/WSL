@@ -29,6 +29,8 @@ struct ContainerSettings : ContainerSettingsT<ContainerSettings>
     void Name(hstring const& value);
     winrt::Microsoft::WSL::Containers::ProcessSettings InitProcess();
     void InitProcess(winrt::Microsoft::WSL::Containers::ProcessSettings const& value);
+    bool RedirectInitProcessStandardInput();
+    void RedirectInitProcessStandardInput(bool value);
     winrt::Windows::Foundation::IReference<winrt::Microsoft::WSL::Containers::ContainerNetworkingMode> NetworkingMode();
     void NetworkingMode(winrt::Windows::Foundation::IReference<winrt::Microsoft::WSL::Containers::ContainerNetworkingMode> const& value);
     hstring HostName();
@@ -54,6 +56,7 @@ private:
     std::string m_imageName;
     std::string m_name;
     winrt::Microsoft::WSL::Containers::ProcessSettings m_initProcess{nullptr};
+    bool m_redirectInitProcessStandardInput{false};
     winrt::Windows::Foundation::IReference<winrt::Microsoft::WSL::Containers::ContainerNetworkingMode> m_networkingMode{nullptr};
     std::string m_hostName;
     std::string m_domainName;

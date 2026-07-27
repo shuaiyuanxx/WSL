@@ -87,6 +87,7 @@ typedef struct WslcContainerOptionsInternal
     const WslcContainerProcessOptionsInternal* initProcessOptions;
     PCSTR networkMode;
     WslcContainerFlags containerFlags;
+    bool initProcessStandardInput;
 
 } WslcContainerOptionsInternal;
 
@@ -124,6 +125,7 @@ struct WslcContainerImpl
     wil::com_ptr<IWSLCCompatContainer> container;
     WslcContainerProcessIOCallbackOptions ioCallbackOptions{};
     std::atomic<std::shared_ptr<IOCallback>> ioCallbacks;
+    bool initProcessStandardInput = false;
 };
 
 WslcContainerImpl* GetInternalType(WslcContainer handle);
@@ -135,6 +137,9 @@ struct WslcProcessImpl
 };
 
 WslcProcessImpl* GetInternalType(WslcProcess handle);
+
+struct WslcDebugTransportImpl;
+WslcDebugTransportImpl* GetInternalType(WslcDebugTransport handle);
 
 // Converts to the internal type and throws an error on null input.
 template <typename T>

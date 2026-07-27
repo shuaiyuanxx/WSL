@@ -147,6 +147,7 @@ namespace Microsoft.WSL.Containers
 
         String Name;
         ProcessSettings InitProcess;
+        Boolean RedirectInitProcessStandardInput;
         Windows.Foundation.IReference<ContainerNetworkingMode> NetworkingMode;
         String HostName;
         String DomainName;
@@ -218,10 +219,16 @@ namespace Microsoft.WSL.Containers
     delegate void ProcessOutputHandler(UInt8[] data);
     delegate void ProcessExitHandler(Int32 exitCode);
 
+    [default_interface]
+    runtimeclass DebugTransport : Windows.Foundation.IClosable
+    {
+    };
+
     runtimeclass Process : Windows.Foundation.IClosable
     {
         void Start();
 
+        DebugTransport CreateDebugTransport(String pipeName, String capabilityToken, String correlationId, String providerId);
         void Signal(Signal signal);
         Windows.Storage.Streams.IInputStream GetOutputStream(ProcessOutputHandle outputHandle);
         Windows.Storage.Streams.IOutputStream GetInputStream();

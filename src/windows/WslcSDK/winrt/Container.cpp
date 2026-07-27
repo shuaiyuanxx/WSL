@@ -22,7 +22,8 @@ Abstract:
 using namespace winrt::Windows::Foundation;
 
 namespace winrt::Microsoft::WSL::Containers::implementation {
-Container::Container(WslcSession session, winrt::Microsoft::WSL::Containers::ContainerSettings const& settings)
+Container::Container(WslcSession session, winrt::Microsoft::WSL::Containers::ContainerSettings const& settings) :
+    m_redirectInitProcessStandardInput(settings.RedirectInitProcessStandardInput())
 {
     if (settings.InitProcess())
     {
@@ -42,7 +43,8 @@ void Container::Start()
         WI_SetFlagIf(
             startFlags,
             WSLC_CONTAINER_START_FLAG_ATTACH,
-            m_initProcess->OutputMode() == ProcessOutputMode::Event || m_initProcess->OutputMode() == ProcessOutputMode::Stream);
+            m_redirectInitProcessStandardInput || m_initProcess->OutputMode() == ProcessOutputMode::Event ||
+                m_initProcess->OutputMode() == ProcessOutputMode::Stream);
     }
 
     wil::unique_cotaskmem_string errorMessage;

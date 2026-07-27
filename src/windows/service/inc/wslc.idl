@@ -591,6 +591,169 @@ typedef struct _WSLCListContainersOptions
     ULONG FiltersCount;
 } WSLCListContainersOptions;
 
+// MIDL-visible constants for the debug intent structures below (used as array
+// bounds, so they must be defined before the first struct that references them).
+const ULONG WSLC_DEBUG_MAX_PATH_LENGTH = 1024;
+const ULONG WSLC_DEBUG_MAX_PROVIDER_ID_LENGTH = 64;
+const ULONG WSLC_DEBUG_MAX_IMAGE_REF_LENGTH = 512;
+const ULONG WSLC_DEBUG_SHA256_HEX_LENGTH = 64;
+const ULONG WSLC_DEBUG_INTENT_TOKEN_BYTES = 32;   // 256-bit
+const ULONG WSLC_DEBUG_ENDPOINT_MAX_LENGTH = 256;
+const ULONG WSLC_DEBUG_MAX_TARGET_ARGS = 64;
+
+//
+// Narrow, immutable debug policy handed to the per-user session process when a
+// debug intent has been claimed during CreateSession. This is internal to the
+// service<->wslcsession channel. It intentionally carries only the fields the
+// session needs to stand up the debug transport; it never carries arbitrary
+// commands. The Token is the service-generated 256-bit correlation/authorization
+// token; it must not be logged or emitted in telemetry.
+//
+typedef struct _WSLCDebugPolicy
+{
+    ULONG Version; // WSLC_DEBUG_INTENT_VERSION_1
+
+    GUID IntentId;
+    LPCSTR ProviderId;
+
+    // Linux target the debugger should attach to / launch.
+    LPCSTR TargetProgram;
+    [unique] LPCSTR TargetWorkingDirectory;
+    LPCSTR DebuggerPath;
+
+    // Optional image binding carried through for the session to validate.
+    [unique] LPCSTR ImageReference;
+    [unique] LPCSTR ImageSha256Hex;
+
+    // Service-generated named-pipe endpoint the transport connects to.
+    LPCWSTR Endpoint;
+
+    // Service-generated 256-bit token. Secret; do not log.
+    byte Token[WSLC_DEBUG_INTENT_TOKEN_BYTES];
+} WSLCDebugPolicy;
+
+//
+// Debug Intent control plane.
+//
+// The Debug Intent control plane lets a Windows host process (e.g. a VS Code
+// debug broker) register, ahead of time, its intent to debug the first process
+// created in a session it is about to spawn. It is an out-of-band, identity-bound,
+// one-shot reservation:
+//
+//   1. The host registers an intent via IWSLCDebugIntentManager::RegisterDebugIntent.
+//      The service captures the caller's real SID/PID/creation-time/image identity
+//      and generates a server-side intent ID, a server-side named-pipe endpoint and
+//      a 256-bit token. None of the server-generated secrets are echoed to logs.
+//   2. The host launches the session-creating client (which calls CreateSession).
+//   3. Inside CreateSession the service opens the authoritative caller process,
+//      derives its SID and image identity and claims at most one matching, unexpired,
+//      unclaimed intent. On ambiguity it fails closed. On no match ordinary behavior
+//      is preserved exactly.
+//   4. The claimed debug policy is propagated into the per-user session process via
+//      the internal WSLCSessionInitSettings (service<->wslcsession only), never via
+//      the public WSLCSessionSettings.
+//
+// The structures below are fixed/versioned to keep the ABI stable for the gdb-mi
+// Preview. Arbitrary command strings are intentionally NOT accepted.
+//
+
+// N.B. The WSLC_DEBUG_* length constants are declared as MIDL `const ULONG`
+// above (near WSLCDebugPolicy) so they are visible both to MIDL array bounds
+// and, via the generated header, to C++ consumers. Do not also emit them as
+// cpp_quote #defines here or the generated header will redefine them.
+
+// Fixed, versioned input describing a debug intent. Version must be
+// WSLC_DEBUG_INTENT_VERSION_1 for this ABI. Grow additively by bumping the
+// version and appending fields; never reorder or repurpose existing ones.
+cpp_quote("#define WSLC_DEBUG_INTENT_VERSION_1 1")
+
+typedef struct _WSLCDebugIntentRequest
+{
+    // ABI version. Must be WSLC_DEBUG_INTENT_VERSION_1.
+    ULONG Version;
+
+    // Expected identity of the Windows host process that will call CreateSession.
+    // The file name (e.g. "wsl.exe") is required; the full path is optional but,
+    // when present, is matched case-insensitively against the authoritative caller.
+    LPCWSTR ExpectedHostFileName;
+    [unique] LPCWSTR ExpectedHostFilePath;
+
+    // Debug provider identifier (allowlisted server-side, e.g. "gdb-mi").
+    LPCSTR ProviderId;
+
+    // OCI-style image reference the debug session targets (informational + bound
+    // into the policy), plus its expected SHA-256 as hex (64 chars). The service
+    // accepts either case and normalizes it to lowercase.
+    [unique] LPCSTR ImageReference;
+    [unique] LPCSTR ImageSha256Hex;
+
+    // The Linux target: absolute path of the program to debug, its working
+    // directory (absolute) and the absolute path of the debugger inside the guest.
+    LPCSTR TargetProgram;
+    [unique] LPCSTR TargetWorkingDirectory;
+    LPCSTR DebuggerPath;
+
+    // How long, in milliseconds, the intent remains claimable before it expires.
+    // Clamped server-side to a sane maximum.
+    ULONG ExpiryMs;
+} WSLCDebugIntentRequest;
+
+// Fixed, versioned output returned on successful registration. All secrets
+// (endpoint + token) are generated by the service, never supplied by the caller.
+typedef struct _WSLCDebugIntentResult
+{
+    ULONG Version;
+
+    // Service-generated intent identifier. Stable for the lifetime of the intent
+    // and required to cancel/watch it.
+    GUID IntentId;
+
+    // Service-generated named-pipe endpoint the debugger transport should connect
+    // to once the session is created. Fully qualified (e.g. "\\.\pipe\...").
+    wchar_t Endpoint[WSLC_DEBUG_ENDPOINT_MAX_LENGTH];
+
+    // Service-generated 256-bit correlation/authorization token.
+    byte Token[WSLC_DEBUG_INTENT_TOKEN_BYTES];
+
+    // Absolute expiry as a FILETIME-derived 100ns tick count (UTC).
+    ULONGLONG ExpiryFileTime;
+} WSLCDebugIntentResult;
+
+// Lifecycle state reported by WatchDebugIntent.
+typedef enum _WSLCDebugIntentState
+{
+    WSLCDebugIntentStatePending = 0,   // Registered, not yet claimed.
+    WSLCDebugIntentStateClaimed = 1,   // Claimed by a matching CreateSession.
+    WSLCDebugIntentStateExpired = 2,   // Expired before being claimed.
+    WSLCDebugIntentStateCancelled = 3, // Explicitly cancelled by the owner.
+} WSLCDebugIntentState;
+
+//
+// IWSLCDebugIntentManager - independent control-plane interface exposed on the
+// WSLCSessionManager coclass. Kept separate from IWSLCSessionManager so the
+// existing session-manager vtable is never modified.
+//
+[
+    uuid(6E1D4C2A-3F58-4B9E-8A17-2D5C7E9B4F60),
+    pointer_default(unique),
+    object
+]
+interface IWSLCDebugIntentManager : IUnknown
+{
+    // Registers a debug intent. On success returns the service-generated intent
+    // ID, endpoint and token. The registering caller's identity is captured and
+    // bound; only that identity may cancel or watch the intent.
+    HRESULT RegisterDebugIntent([in] const WSLCDebugIntentRequest* Request, [out] WSLCDebugIntentResult* Result);
+
+    // Cancels a previously registered intent. Enforces caller-identity ownership.
+    // Succeeds idempotently if the intent is already gone.
+    HRESULT CancelDebugIntent([in] REFGUID IntentId);
+
+    // Returns the current lifecycle state of an intent. Enforces caller-identity
+    // ownership. Fails with WSLC_E_DEBUG_INTENT_NOT_FOUND if unknown.
+    HRESULT GetDebugIntentState([in] REFGUID IntentId, [out] WSLCDebugIntentState* State);
+}
+
 // Settings for IWSLCSession::Initialize - passed from service to per-user process
 typedef struct _WSLCSessionInitSettings
 {
@@ -605,6 +768,13 @@ typedef struct _WSLCSessionInitSettings
     WSLCNetworkingMode NetworkingMode;
     WSLCFeatureFlags FeatureFlags;
     [unique] LPCSTR RootVhdTypeOverride;
+
+    // Narrow, immutable internal debug policy propagated when a debug intent was
+    // claimed during CreateSession. This is service<->wslcsession internal and must
+    // never be surfaced in the public WSLCSessionSettings. DebugPolicy is NULL when
+    // no intent was claimed (ordinary sessions). The pointee's backing storage is
+    // kept alive by the caller through the synchronous CreateSession marshaling.
+    [unique] const WSLCDebugPolicy* DebugPolicy;
 } WSLCSessionInitSettings;
 
 [
@@ -779,3 +949,7 @@ cpp_quote("#define WSLC_E_CONTAINER_DISABLED MAKE_HRESULT(SEVERITY_ERROR, FACILI
 cpp_quote("#define WSLC_E_REGISTRY_BLOCKED_BY_POLICY MAKE_HRESULT(SEVERITY_ERROR, FACILITY_ITF, WSLC_E_BASE + 13) /* 0x8004060D */")
 cpp_quote("#define WSLC_E_VOLUME_NOT_AVAILABLE MAKE_HRESULT(SEVERITY_ERROR, FACILITY_ITF, WSLC_E_BASE + 14) /* 0x8004060E */")
 cpp_quote("#define WSLC_E_SESSION_NOT_FOUND MAKE_HRESULT(SEVERITY_ERROR, FACILITY_ITF, WSLC_E_BASE + 15) /* 0x8004060F */")
+cpp_quote("#define WSLC_E_DEBUG_INTENT_NOT_FOUND MAKE_HRESULT(SEVERITY_ERROR, FACILITY_ITF, WSLC_E_BASE + 16) /* 0x80040610 */")
+cpp_quote("#define WSLC_E_DEBUG_INTENT_EXPIRED MAKE_HRESULT(SEVERITY_ERROR, FACILITY_ITF, WSLC_E_BASE + 17) /* 0x80040611 */")
+cpp_quote("#define WSLC_E_DEBUG_INTENT_AMBIGUOUS MAKE_HRESULT(SEVERITY_ERROR, FACILITY_ITF, WSLC_E_BASE + 18) /* 0x80040612 */")
+cpp_quote("#define WSLC_E_DEBUG_PROVIDER_NOT_ALLOWED MAKE_HRESULT(SEVERITY_ERROR, FACILITY_ITF, WSLC_E_BASE + 19) /* 0x80040613 */")

@@ -76,6 +76,21 @@ void ContainerSettings::InitProcess(winrt::Microsoft::WSL::Containers::ProcessSe
     m_initProcess = value;
 }
 
+bool ContainerSettings::RedirectInitProcessStandardInput()
+{
+    return m_redirectInitProcessStandardInput;
+}
+
+void ContainerSettings::RedirectInitProcessStandardInput(bool value)
+{
+    if (m_containerSettings)
+    {
+        throw winrt::hresult_illegal_state_change(L"Cannot change init process standard input after container has been initialized");
+    }
+
+    m_redirectInitProcessStandardInput = value;
+}
+
 winrt::Windows::Foundation::IReference<winrt::Microsoft::WSL::Containers::ContainerNetworkingMode> ContainerSettings::NetworkingMode()
 {
     return m_networkingMode;
@@ -247,6 +262,9 @@ WslcContainerSettings* ContainerSettings::ToStructPointer()
         {
             winrt::check_hresult(WslcSetContainerSettingsInitProcess(m_containerSettings.get(), GetStructPointer(m_initProcess)));
         }
+
+        winrt::check_hresult(
+            WslcSetContainerSettingsInitProcessStandardInput(m_containerSettings.get(), m_redirectInitProcessStandardInput));
 
         if (m_networkingMode)
         {

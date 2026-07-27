@@ -23,7 +23,9 @@ Abstract:
 #include "WSLCProcess.h"
 #include "WSLCProcessIO.h"
 #include "WSLCVolumes.h"
+#include "WSLCDebugPolicy.h"
 #include "APICompat.h"
+#include "../WslcSDK/DebugTransport.h"
 
 namespace apicompat = wsl::windows::common::apicompat;
 
@@ -605,7 +607,8 @@ WSLCContainerImpl::WSLCContainerImpl(
     WSLCContainerState InitialState,
     std::uint64_t CreatedAt,
     WSLCProcessFlags InitProcessFlags,
-    WSLCContainerFlags ContainerFlags) :
+    WSLCContainerFlags ContainerFlags,
+    std::unique_ptr<WSLCDebugPolicyOwned>&& DebugPolicy) :
     m_wslcSession(wslcSession),
     m_pluginNotifier(pluginNotifier),
     m_virtualMachine(virtualMachine),
@@ -627,7 +630,8 @@ WSLCContainerImpl::WSLCContainerImpl(
     m_state(InitialState),
     m_createdAt(CreatedAt),
     m_initProcessFlags(InitProcessFlags),
-    m_containerFlags(ContainerFlags)
+    m_containerFlags(ContainerFlags),
+    m_debugPolicy(std::move(DebugPolicy))
 {
 }
 
@@ -647,6 +651,9 @@ WSLCContainerImpl::~WSLCContainerImpl()
     {
         auto lock = m_lock.lock_exclusive();
         std::lock_guard processesLock{m_processesLock};
+        // Stop the debug transport (joins its worker thread and closes its duplicated stdio) before
+        // the init process and its IO are released below.
+        m_debugTransport.reset();
         initProcessControl = std::exchange(m_initProcessControl, nullptr);
         processes = std::exchange(m_processes, {});
     }
@@ -829,6 +836,14 @@ void WSLCContainerImpl::Start(WSLCContainerStartFlags Flags, const WSLCProcessSt
     // Attach to the container's init process so no IO is lost.
     std::unique_ptr<WSLCProcessIO> io;
 
+    // For a debug-controlled container the host may not request attach, but the debug transport
+    // needs the init process stdio, so force attach regardless of the caller's flags.
+    const bool debugControlled = m_debugPolicy != nullptr;
+    if (debugControlled)
+    {
+        Flags = static_cast<WSLCContainerStartFlags>(Flags | WSLCContainerStartFlagsAttach);
+    }
+
     try
     {
         if (WI_IsFlagSet(Flags, WSLCContainerStartFlagsAttach))
@@ -856,9 +871,13 @@ void WSLCContainerImpl::Start(WSLCContainerStartFlags Flags, const WSLCProcessSt
     std::lock_guard processesLock{m_processesLock};
     m_initProcessControl = control.get();
 
-    m_initProcess = wil::MakeOrThrow<WSLCProcess>(std::move(control), std::move(io), m_initProcessFlags);
+    auto concreteInitProcess = wil::MakeOrThrow<WSLCProcess>(std::move(control), std::move(io), m_initProcessFlags);
+    WSLCProcess* const initProcessRaw = concreteInitProcess.Get();
+    m_initProcess = std::move(concreteInitProcess);
 
     auto cleanup = wil::scope_exit_log(WI_DIAGNOSTICS_INFO, [this]() mutable {
+        // Stop the debug transport before releasing the process/io it relays.
+        m_debugTransport.reset();
         m_initProcess.Reset();
         m_initProcessControl = nullptr;
     });
@@ -893,6 +912,50 @@ void WSLCContainerImpl::Start(WSLCContainerStartFlags Flags, const WSLCProcessSt
         m_dockerClient.StartContainer(m_id, detachKeys);
     }
     CATCH_AND_THROW_DOCKER_USER_ERROR("Failed to start container '%hs'", m_id.c_str());
+
+    // For a debug-controlled container, stand up the authenticated debug transport now that the
+    // init process (the guest debugger) is running and its stdio is attached. The transport owns
+    // duplicated stdin/stdout/stderr handles and a duplicated process-exit event, and serves the
+    // service-generated named-pipe endpoint. It waits for the host cppdbg client (which the
+    // extension launches after the DAP session) to connect and authenticate.
+    if (debugControlled)
+    {
+        try
+        {
+            auto standardInput = initProcessRaw->GetStdHandle(WSLCFDStdin);
+            auto standardOutput = initProcessRaw->GetStdHandle(WSLCFDStdout);
+            wil::unique_handle standardError;
+            if (WI_IsFlagSet(m_initProcessFlags, WSLCProcessFlagsStdin))
+            {
+                // stderr is optional; the relay drains it if present. gdb-mi multiplexes on stdout.
+                try
+                {
+                    standardError = initProcessRaw->GetStdHandle(WSLCFDStderr);
+                }
+                CATCH_LOG();
+            }
+
+            wil::unique_handle processExitEvent{wsl::windows::common::wslutil::DuplicateHandle(
+                initProcessRaw->GetExitEvent(), SYNCHRONIZE, FALSE)};
+
+            initProcessRaw->SetDebugTransportOwnsIo();
+            m_debugTransport = std::make_unique<WslcDebugTransportImpl>(
+                std::move(standardInput),
+                std::move(standardOutput),
+                std::move(standardError),
+                std::move(processExitEvent),
+                m_debugPolicy->Endpoint.c_str(),
+                m_debugPolicy->CapabilityTokenHex.c_str(),
+                m_debugPolicy->CorrelationId.c_str(),
+                wsl::windows::common::string::MultiByteToWide(m_debugPolicy->ProviderId).c_str());
+
+            WSL_LOG(
+                "WSLCDebugTransportStarted",
+                TraceLoggingValue(m_id.c_str(), "Id"),
+                TraceLoggingValue(m_debugPolicy->ProviderId.c_str(), "Provider"));
+        }
+        CATCH_LOG();
+    }
 
     if (WI_IsFlagSet(m_initProcessFlags, WSLCProcessFlagsTty) && StartOptions != nullptr)
     {
@@ -1608,7 +1671,8 @@ std::shared_ptr<WSLCContainerImpl> WSLCContainerImpl::Create(
     std::function<void(const WSLCContainerImpl*)>&& OnDeleted,
     DockerEventTracker& EventTracker,
     DockerHTTPClient& DockerClient,
-    IORelay& IoRelay)
+    IORelay& IoRelay,
+    std::unique_ptr<WSLCDebugPolicyOwned>&& DebugPolicy)
 {
     common::docker_schema::CreateContainer request;
     request.Image = containerOptions.Image;
@@ -2072,7 +2136,8 @@ std::shared_ptr<WSLCContainerImpl> WSLCContainerImpl::Create(
         WslcContainerStateCreated,
         ParseDockerTimestamp(inspectData.Created),
         containerOptions.InitProcessOptions.Flags,
-        containerOptions.Flags);
+        containerOptions.Flags,
+        std::move(DebugPolicy));
 
     container->Initialize();
 
@@ -2390,6 +2455,8 @@ __requires_exclusive_lock_held(m_lock) void WSLCContainerImpl::ReleaseProcesses(
     decltype(m_processes) processes;
     {
         std::lock_guard processesLock{m_processesLock};
+        // Stop the debug transport before releasing the init process it relays.
+        m_debugTransport.reset();
         processes = std::exchange(m_processes, {});
     }
 

@@ -49,7 +49,19 @@ try
     RETURN_HR_IF_NULL(E_POINTER, Handle);
     RETURN_HR_IF_MSG(HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED), !m_io, "Process IO not attached");
 
-    auto typedHandle = m_io->OpenFd(Fd);
+    TypedHandle typedHandle;
+    if (m_debugTransportOwnsIo && (Fd == WSLCFDStdout || Fd == WSLCFDStderr))
+    {
+        // The debug transport is the sole MI reader. Give ordinary Host output callbacks
+        // an already-closed pipe so they observe EOF without stealing debugger bytes.
+        auto [readHandle, writeHandle] = wsl::windows::common::wslutil::OpenAnonymousPipe(1, true, false);
+        writeHandle.reset();
+        typedHandle = TypedHandle{wil::unique_handle{readHandle.release()}, WSLCHandleTypePipe};
+    }
+    else
+    {
+        typedHandle = m_io->OpenFd(Fd);
+    }
 
     RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), !typedHandle.is_valid());
 
@@ -85,6 +97,11 @@ wil::unique_handle WSLCProcess::GetStdHandle(int Index)
     THROW_WIN32_IF(ERROR_INVALID_STATE, !m_io);
 
     return std::move(m_io->OpenFd(Index).Handle);
+}
+
+void WSLCProcess::SetDebugTransportOwnsIo() noexcept
+{
+    m_debugTransportOwnsIo = true;
 }
 
 HANDLE WSLCProcess::GetExitEvent()

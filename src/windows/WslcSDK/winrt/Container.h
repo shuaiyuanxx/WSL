@@ -41,6 +41,7 @@ private:
     void EnsureNotClosed() const;
 
     winrt::com_ptr<implementation::Process> m_initProcess;
+    bool m_redirectInitProcessStandardInput = false;
 
     // Releasing the container handle will end the processes and disconnect the callbacks.
     // Keep this at the end so that it is released first, ensuring the init process' events aren't destroyed while they may still be signaled.

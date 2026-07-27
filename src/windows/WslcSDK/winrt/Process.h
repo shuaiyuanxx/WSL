@@ -24,6 +24,11 @@ struct Process : ProcessT<Process>
     Process(winrt::Microsoft::WSL::Containers::Container const& container, winrt::Microsoft::WSL::Containers::ProcessSettings const& settings);
 
     void Start();
+    winrt::Microsoft::WSL::Containers::DebugTransport CreateDebugTransport(
+        hstring const& pipeName,
+        hstring const& capabilityToken,
+        hstring const& correlationId,
+        hstring const& providerId);
     uint32_t Pid();
     winrt::Microsoft::WSL::Containers::ProcessState State();
     int32_t ExitCode();

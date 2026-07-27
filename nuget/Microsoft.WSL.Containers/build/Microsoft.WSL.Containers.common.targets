@@ -21,6 +21,14 @@
         <WslcImage>
             <Image></Image>
             <TarLocation></TarLocation>
+            <!-- Opt-in debug manifest metadata. DebugProvider currently supports gdb-mi. -->
+            <DebugProvider></DebugProvider>
+            <DebugProgram></DebugProgram>
+            <DebugWorkingDirectory></DebugWorkingDirectory>
+            <DebugDebuggerPath></DebugDebuggerPath>
+            <DebugContainerSourceRoot></DebugContainerSourceRoot>
+            <DebugWorkspaceSourceRoot></DebugWorkspaceSourceRoot>
+            <DebugArchitecture></DebugArchitecture>
         </WslcImage>
     </ItemDefinitionGroup>
 
@@ -55,6 +63,38 @@
         <Error Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('%(WslcImage.Identity)', '[/\\:*?&quot;&lt;&gt;|]'))"
                Code="WSLC0004"
                Text="WslcImage with Include='%(WslcImage.Identity)' contains a character invalid for filesystem names (one of / \ : * ? &quot; &lt; &gt; |). The Identity is used as the default tar filename and in .tlog filenames. Use a simple identity in Include (e.g. Include=&quot;my-image&quot;) and put the registry/org/tag in the Image metadata." />
+
+        <Error Condition="'%(WslcImage.DebugProvider)' != '' AND '%(WslcImage.DebugProvider)' != 'gdb-mi'"
+               Code="WSLC0008"
+               Text="WslcImage '%(WslcImage.Identity)' specifies unsupported DebugProvider '%(WslcImage.DebugProvider)'. The current preview supports only 'gdb-mi'." />
+
+        <Error Condition="'%(WslcImage.DebugProvider)' != '' AND '%(WslcImage.DebugProgram)' == ''"
+               Code="WSLC0009"
+               Text="WslcImage '%(WslcImage.Identity)' must specify DebugProgram when DebugProvider is enabled." />
+
+        <Error Condition="'%(WslcImage.DebugProvider)' != '' AND '%(WslcImage.DebugContainerSourceRoot)' == ''"
+               Code="WSLC0010"
+               Text="WslcImage '%(WslcImage.Identity)' must specify DebugContainerSourceRoot when DebugProvider is enabled." />
+
+        <Error Condition="'%(WslcImage.DebugProvider)' != '' AND '%(WslcImage.DebugWorkspaceSourceRoot)' == ''"
+               Code="WSLC0011"
+               Text="WslcImage '%(WslcImage.Identity)' must specify DebugWorkspaceSourceRoot when DebugProvider is enabled." />
+
+        <Error Condition="'%(WslcImage.DebugProvider)' != '' AND $([System.IO.Path]::IsPathRooted('%(WslcImage.DebugWorkspaceSourceRoot)'))"
+               Code="WSLC0012"
+               Text="WslcImage '%(WslcImage.Identity)' DebugWorkspaceSourceRoot must be relative to the project directory." />
+
+        <Error Condition="'%(WslcImage.DebugProvider)' != '' AND $([System.Text.RegularExpressions.Regex]::IsMatch('%(WslcImage.DebugWorkspaceSourceRoot)', '(^|[/\\])\.\.([/\\]|$)'))"
+               Code="WSLC0013"
+               Text="WslcImage '%(WslcImage.Identity)' DebugWorkspaceSourceRoot cannot traverse outside the project directory." />
+
+        <Error Condition="'%(WslcImage.DebugProvider)' != '' AND $([System.Text.RegularExpressions.Regex]::IsMatch('%(WslcImage.DebugProvider)%(WslcImage.DebugProgram)%(WslcImage.DebugWorkingDirectory)%(WslcImage.DebugDebuggerPath)%(WslcImage.DebugContainerSourceRoot)%(WslcImage.DebugWorkspaceSourceRoot)%(WslcImage.DebugArchitecture)', '[&quot;\r\n]'))"
+               Code="WSLC0014"
+               Text="WslcImage '%(WslcImage.Identity)' debug metadata cannot contain quotes or newline characters." />
+
+        <Error Condition="'%(WslcImage.DebugProvider)' != '' AND '%(WslcImage.DebugArchitecture)' != 'x64' AND '%(WslcImage.DebugArchitecture)' != 'arm64'"
+               Code="WSLC0015"
+               Text="WslcImage '%(WslcImage.Identity)' must specify DebugArchitecture as 'x64' or 'arm64'." />
     </Target>
 
     <!-- Dispatch each WslcImage via MSBuild task instead of batching directly because:
@@ -73,9 +113,9 @@
             Condition="'@(WslcImage)' != '' AND '$(DesignTimeBuild)' != 'true' AND '$(IsCrossTargetingBuild)' != 'true'">
 
         <MSBuild Projects="$(MSBuildProjectFullPath)"
-                 Targets="_WslcBuildAndSaveSingleImage"
+                 Targets="_WslcBuildAndSaveSingleImage;_WslcWriteDebugManifest"
                  StopOnFirstFailure="true"
-                 Properties="Configuration=$(Configuration);Platform=$(Platform);_WslcName=%(WslcImage.Identity);_WslcImage=%(WslcImage.Image);_WslcDockerfile=%(WslcImage.Dockerfile);_WslcContext=%(WslcImage.Context);_WslcSourceDir=$([MSBuild]::Escape('%(WslcImage.Sources)'));_WslcIntDir=$(_WslcIntDir);_WslcTarLocation=%(WslcImage.TarLocation);_WslcOutDir=$(OutDir)" />
+                 Properties="Configuration=$(Configuration);Platform=$(Platform);_WslcName=%(WslcImage.Identity);_WslcImage=%(WslcImage.Image);_WslcDockerfile=%(WslcImage.Dockerfile);_WslcContext=%(WslcImage.Context);_WslcSourceDir=$([MSBuild]::Escape('%(WslcImage.Sources)'));_WslcIntDir=$(_WslcIntDir);_WslcTarLocation=%(WslcImage.TarLocation);_WslcOutDir=$(OutDir);_WslcDebugProvider=%(WslcImage.DebugProvider);_WslcDebugProgram=%(WslcImage.DebugProgram);_WslcDebugWorkingDirectory=%(WslcImage.DebugWorkingDirectory);_WslcDebugDebuggerPath=%(WslcImage.DebugDebuggerPath);_WslcDebugContainerSourceRoot=%(WslcImage.DebugContainerSourceRoot);_WslcDebugWorkspaceSourceRoot=%(WslcImage.DebugWorkspaceSourceRoot);_WslcDebugArchitecture=%(WslcImage.DebugArchitecture)" />
     </Target>
 
     <!--
@@ -165,6 +205,50 @@
                  Text="wslc image prune failed (exit code $(_WslcPruneExitCode)). The image and tar were saved successfully; only the post-build prune was skipped. Set WslcTreatPruneFailureAsError=true to fail the build instead." />
     </Target>
 
+    <!-- Write a versioned, deterministic debug manifest beside the image tar.
+         The manifest is opt-in and contains only allowlisted declarative metadata. -->
+    <Target Name="_WslcWriteDebugManifest"
+            DependsOnTargets="_WslcResolveImageRef;_WslcResolveSavePath"
+            Condition="'$(_WslcDebugProvider)' != ''">
+
+        <PropertyGroup>
+            <_WslcDebugWorkingDirectory Condition="'$(_WslcDebugWorkingDirectory)' == ''">/</_WslcDebugWorkingDirectory>
+            <_WslcDebugDebuggerPath Condition="'$(_WslcDebugDebuggerPath)' == ''">/usr/bin/gdb</_WslcDebugDebuggerPath>
+            <_WslcDebugManifestPath>$([System.IO.Path]::ChangeExtension('$(_WslcTarPath)', '.wslcdebug.json'))</_WslcDebugManifestPath>
+            <_WslcDebugManifestDir>$([System.IO.Path]::GetDirectoryName('$(_WslcDebugManifestPath)'))</_WslcDebugManifestDir>
+            <_WslcDebugProjectPath>$([MSBuild]::MakeRelative('$(MSBuildProjectDirectory)', '$(MSBuildProjectFullPath)').Replace('\', '/'))</_WslcDebugProjectPath>
+            <_WslcDebugWorkspaceSourceRoot>$([System.String]::Copy('$(_WslcDebugWorkspaceSourceRoot)').Replace('\', '/'))</_WslcDebugWorkspaceSourceRoot>
+        </PropertyGroup>
+
+        <MakeDir Directories="$(_WslcDebugManifestDir)" Condition="'$(_WslcDebugManifestDir)' != ''" />
+        <GetFileHash Files="$(_WslcTarPath)" Algorithm="SHA256">
+            <Output TaskParameter="Items" ItemName="_WslcDebugTarHash" />
+        </GetFileHash>
+        <PropertyGroup>
+            <_WslcDebugTarHashValue>@(_WslcDebugTarHash->'%(FileHash)')</_WslcDebugTarHashValue>
+        </PropertyGroup>
+
+        <ItemGroup>
+            <_WslcDebugManifestLines Include="{" />
+            <_WslcDebugManifestLines Include="  &quot;schemaVersion&quot;: { &quot;major&quot;: 1, &quot;minor&quot;: 0 }," />
+            <_WslcDebugManifestLines Include="  &quot;targetId&quot;: &quot;$(_WslcName)&quot;," />
+            <_WslcDebugManifestLines Include="  &quot;hostProject&quot;: &quot;$(_WslcDebugProjectPath)&quot;," />
+            <_WslcDebugManifestLines Include="  &quot;image&quot;: { &quot;reference&quot;: &quot;$(_WslcFullRef)&quot;, &quot;tar&quot;: &quot;$([System.IO.Path]::GetFileName('$(_WslcTarPath)'))&quot;, &quot;sha256&quot;: &quot;$(_WslcDebugTarHashValue)&quot;, &quot;architecture&quot;: &quot;$(_WslcDebugArchitecture)&quot; }," />
+            <_WslcDebugManifestLines Include="  &quot;provider&quot;: { &quot;id&quot;: &quot;$(_WslcDebugProvider)&quot;, &quot;debuggerPath&quot;: &quot;$(_WslcDebugDebuggerPath)&quot; }," />
+            <_WslcDebugManifestLines Include="  &quot;target&quot;: { &quot;program&quot;: &quot;$(_WslcDebugProgram)&quot;, &quot;workingDirectory&quot;: &quot;$(_WslcDebugWorkingDirectory)&quot; }," />
+            <_WslcDebugManifestLines Include="  &quot;sourceMappings&quot;: [ { &quot;containerRoot&quot;: &quot;$(_WslcDebugContainerSourceRoot)&quot;, &quot;workspaceRoot&quot;: &quot;$(_WslcDebugWorkspaceSourceRoot)&quot; } ]," />
+            <_WslcDebugManifestLines Include="  &quot;requirements&quot;: { &quot;minimumExtensionVersion&quot;: &quot;0.1.0&quot;, &quot;transportProtocolMajor&quot;: 1 }" />
+            <_WslcDebugManifestLines Include="}" />
+        </ItemGroup>
+
+        <WriteLinesToFile File="$(_WslcDebugManifestPath)"
+                          Lines="@(_WslcDebugManifestLines)"
+                          Overwrite="true"
+                          WriteOnlyWhenDifferent="true"
+                          Encoding="UTF-8" />
+        <Message Importance="high" Text="WSLC: Wrote debug manifest '$(_WslcDebugManifestPath)'." />
+    </Target>
+
     <!-- Clean container artifacts. ContinueOnError so a transient file lock
          (AV scanner, downstream consumer) doesn't block the rest of clean.
          .tmp variants are removed too — a failed save can leave one behind. -->
@@ -186,6 +270,14 @@
 
         <Delete Files="$(OutDir)%(WslcImage.Identity).tar.tmp"
                 Condition="'%(WslcImage.TarLocation)' == ''"
+                ContinueOnError="WarnAndContinue" />
+
+        <Delete Files="$([System.IO.Path]::ChangeExtension('%(WslcImage.TarLocation)', '.wslcdebug.json'))"
+                Condition="'%(WslcImage.TarLocation)' != '' AND '%(WslcImage.DebugProvider)' != ''"
+                ContinueOnError="WarnAndContinue" />
+
+        <Delete Files="$(OutDir)%(WslcImage.Identity).wslcdebug.json"
+                Condition="'%(WslcImage.TarLocation)' == '' AND '%(WslcImage.DebugProvider)' != ''"
                 ContinueOnError="WarnAndContinue" />
     </Target>
 

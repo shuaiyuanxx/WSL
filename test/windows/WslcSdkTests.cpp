@@ -66,6 +66,9 @@ void CloseProcess(WslcProcess process)
 
 using UniqueProcess = wil::unique_any<WslcProcess, decltype(CloseProcess), CloseProcess>;
 
+using UniqueDebugTransport =
+    wil::unique_any<WslcDebugTransport, decltype(&WslcReleaseDebugTransport), WslcReleaseDebugTransport>;
+
 using UniqueCrashDumpSubscription =
     wil::unique_any<WslcCrashDumpSubscription, decltype(&WslcReleaseCrashDumpSubscription), WslcReleaseCrashDumpSubscription>;
 
@@ -766,6 +769,177 @@ class WslcSdkTests
         }
 
         VERIFY_ARE_EQUAL(WaitForSingleObject(exitEvent, 60 * 1000), WAIT_OBJECT_0);
+    }
+
+    WSLC_TEST_METHOD(InitProcessStandardInput)
+    {
+        VERIFY_ARE_EQUAL(WslcSetContainerSettingsInitProcessStandardInput(nullptr, TRUE), E_POINTER);
+
+        WslcProcessSettings procSettings;
+        VERIFY_SUCCEEDED(WslcInitProcessSettings(&procSettings));
+        const char* argv[] = {"/bin/sh", "-c", "IFS= read -r line; printf 'reply:%s\\n' \"$line\""};
+        VERIFY_SUCCEEDED(WslcSetProcessSettingsCmdLine(&procSettings, argv, ARRAYSIZE(argv)));
+
+        WslcContainerSettings containerSettings;
+        VERIFY_SUCCEEDED(WslcInitContainerSettings("debian:latest", &containerSettings));
+        VERIFY_SUCCEEDED(WslcSetContainerSettingsInitProcess(&containerSettings, &procSettings));
+        VERIFY_SUCCEEDED(WslcSetContainerSettingsInitProcessStandardInput(&containerSettings, TRUE));
+
+        UniqueContainer container;
+        VERIFY_SUCCEEDED(WslcCreateContainer(m_defaultSession, &containerSettings, &container, nullptr));
+        auto cleanup = wil::scope_exit_log(WI_DIAGNOSTICS_INFO, [&]() {
+            LOG_IF_FAILED(WslcDeleteContainer(container.get(), WSLC_DELETE_CONTAINER_FLAG_FORCE, nullptr));
+        });
+        VERIFY_SUCCEEDED(WslcStartContainer(container.get(), WSLC_CONTAINER_START_FLAG_ATTACH, nullptr));
+
+        UniqueProcess process;
+        VERIFY_SUCCEEDED(WslcGetContainerInitProcess(container.get(), &process));
+
+        HANDLE rawStdin = nullptr;
+        VERIFY_SUCCEEDED(WslcGetProcessIOHandle(process.get(), WSLC_PROCESS_IO_HANDLE_STDIN, &rawStdin));
+        wil::unique_handle stdinHandle(rawStdin);
+
+        HANDLE rawStdout = nullptr;
+        VERIFY_SUCCEEDED(WslcGetProcessIOHandle(process.get(), WSLC_PROCESS_IO_HANDLE_STDOUT, &rawStdout));
+        wil::unique_handle stdoutHandle(rawStdout);
+
+        constexpr char input[] = "hello\n";
+        DWORD bytesWritten = 0;
+        VERIFY_WIN32_BOOL_SUCCEEDED(WriteFile(stdinHandle.get(), input, ARRAYSIZE(input) - 1, &bytesWritten, nullptr));
+        VERIFY_ARE_EQUAL(bytesWritten, static_cast<DWORD>(ARRAYSIZE(input) - 1));
+        stdinHandle.reset();
+
+        std::array<char, 64> output{};
+        DWORD bytesRead = 0;
+        VERIFY_WIN32_BOOL_SUCCEEDED(ReadFile(stdoutHandle.get(), output.data(), static_cast<DWORD>(output.size()), &bytesRead, nullptr));
+        VERIFY_ARE_EQUAL(std::string_view(output.data(), bytesRead), std::string_view("reply:hello\n"));
+    }
+
+    WSLC_TEST_METHOD(ProcessDebugTransport)
+    {
+        constexpr wchar_t capabilityToken[] =
+            L"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        constexpr wchar_t correlationId[] = L"debug-transport-test";
+        constexpr wchar_t providerId[] = L"test-stream";
+
+        WslcProcessSettings procSettings;
+        VERIFY_SUCCEEDED(WslcInitProcessSettings(&procSettings));
+        const char* argv[] = {"/bin/cat"};
+        VERIFY_SUCCEEDED(WslcSetProcessSettingsCmdLine(&procSettings, argv, ARRAYSIZE(argv)));
+
+        WslcContainerSettings containerSettings;
+        VERIFY_SUCCEEDED(WslcInitContainerSettings("debian:latest", &containerSettings));
+        VERIFY_SUCCEEDED(WslcSetContainerSettingsInitProcess(&containerSettings, &procSettings));
+        VERIFY_SUCCEEDED(WslcSetContainerSettingsInitProcessStandardInput(&containerSettings, TRUE));
+
+        UniqueContainer container;
+        VERIFY_SUCCEEDED(WslcCreateContainer(m_defaultSession, &containerSettings, &container, nullptr));
+        VERIFY_SUCCEEDED(WslcStartContainer(container.get(), WSLC_CONTAINER_START_FLAG_ATTACH, nullptr));
+
+        UniqueProcess process;
+        VERIFY_SUCCEEDED(WslcGetContainerInitProcess(container.get(), &process));
+
+        const auto pipeName = wsl::windows::common::helpers::GetUniquePipeName();
+        UniqueDebugTransport transport;
+        VERIFY_SUCCEEDED(WslcCreateProcessDebugTransport(
+            process.get(),
+            pipeName.c_str(),
+            capabilityToken,
+            correlationId,
+            providerId,
+            &transport,
+            nullptr));
+
+        const auto connect = [&]() {
+            const auto deadline = std::chrono::steady_clock::now() + 30s;
+            for (;;)
+            {
+                wil::unique_hfile client{CreateFileW(
+                    pipeName.c_str(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    nullptr,
+                    OPEN_EXISTING,
+                    FILE_FLAG_OVERLAPPED,
+                    nullptr)};
+                if (client)
+                {
+                    return client;
+                }
+
+                const auto error = GetLastError();
+                VERIFY_IS_TRUE(error == ERROR_PIPE_BUSY || error == ERROR_FILE_NOT_FOUND);
+                VERIFY_IS_TRUE(std::chrono::steady_clock::now() < deadline);
+                Sleep(10);
+            }
+        };
+
+        const auto writeAll = [](HANDLE handle, const void* data, DWORD size) {
+            DWORD total{};
+            while (total < size)
+            {
+                DWORD written{};
+                VERIFY_WIN32_BOOL_SUCCEEDED(
+                    WriteFile(handle, static_cast<const BYTE*>(data) + total, size - total, &written, nullptr));
+                VERIFY_IS_TRUE(written > 0);
+                total += written;
+            }
+        };
+
+        const auto readAll = [](HANDLE handle, void* data, DWORD size) {
+            DWORD total{};
+            while (total < size)
+            {
+                DWORD read{};
+                VERIFY_WIN32_BOOL_SUCCEEDED(
+                    ReadFile(handle, static_cast<BYTE*>(data) + total, size - total, &read, nullptr));
+                VERIFY_IS_TRUE(read > 0);
+                total += read;
+            }
+        };
+
+        const auto authenticate = [&](HANDLE client, std::wstring_view token, bool accepted) {
+            const auto tokenUtf8 = wsl::windows::common::string::WideToMultiByte(token);
+            const auto correlationUtf8 = wsl::windows::common::string::WideToMultiByte(correlationId);
+            const auto providerUtf8 = wsl::windows::common::string::WideToMultiByte(providerId);
+            const auto request = std::format(
+                "{{\"protocolVersion\":1,\"correlationId\":\"{}\",\"token\":\"{}\",\"providerId\":\"{}\"}}",
+                correlationUtf8,
+                tokenUtf8,
+                providerUtf8);
+            const auto requestLength = gsl::narrow_cast<uint32_t>(request.size());
+            writeAll(client, &requestLength, sizeof(requestLength));
+            writeAll(client, request.data(), requestLength);
+
+            uint32_t responseLength{};
+            readAll(client, &responseLength, sizeof(responseLength));
+            VERIFY_IS_TRUE(responseLength > 0 && responseLength <= 64 * 1024);
+            std::string response(responseLength, '\0');
+            readAll(client, response.data(), responseLength);
+            VERIFY_ARE_NOT_EQUAL(response.find(accepted ? "\"accepted\":true" : "\"accepted\":false"), std::string::npos);
+        };
+
+        {
+            auto invalidClient = connect();
+            authenticate(
+                invalidClient.get(),
+                L"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                false);
+        }
+
+        auto validClient = connect();
+        authenticate(validClient.get(), capabilityToken, true);
+
+        constexpr char message[] = "native-debug-transport\n";
+        writeAll(validClient.get(), message, ARRAYSIZE(message) - 1);
+        std::array<char, ARRAYSIZE(message) - 1> response{};
+        readAll(validClient.get(), response.data(), static_cast<DWORD>(response.size()));
+        VERIFY_ARE_EQUAL(
+            std::string_view(response.data(), response.size()),
+            std::string_view(message, ARRAYSIZE(message) - 1));
+
+        validClient.reset();
+        transport.reset();
     }
 
     WSLC_TEST_METHOD(ContainerNetworkingMode)
@@ -2491,6 +2665,26 @@ class WslcSdkTests
     WSLC_TEST_METHOD(ReleaseNullProcessHandle)
     {
         VERIFY_ARE_EQUAL(WslcReleaseProcess(nullptr), E_POINTER);
+    }
+
+    WSLC_TEST_METHOD(ReleaseNullDebugTransportHandle)
+    {
+        VERIFY_ARE_EQUAL(WslcReleaseDebugTransport(nullptr), E_POINTER);
+    }
+
+    WSLC_TEST_METHOD(CreateDebugTransportInvalidArguments)
+    {
+        WslcDebugTransport transport = nullptr;
+        VERIFY_ARE_EQUAL(
+            WslcCreateProcessDebugTransport(
+                nullptr,
+                L"wslc-debug-test",
+                L"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                L"correlation",
+                L"provider",
+                &transport,
+                nullptr),
+            E_POINTER);
     }
 
     WSLC_TEST_METHOD(CreateContainerWithNullSession)

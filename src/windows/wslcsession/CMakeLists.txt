@@ -17,6 +17,13 @@ set(SOURCES
     WSLCProcessControl.cpp
     WSLCProcessIO.cpp
 
+    # Authenticated debug transport, shared with WslcSDK. Compiled here as a
+    # separate translation unit into wslcsession.exe so the per-user session
+    # process can host a debug endpoint for debug-controlled containers. There is
+    # no duplicate-symbol conflict with wslcsdk.dll because they are distinct
+    # binaries.
+    ${CMAKE_CURRENT_SOURCE_DIR}/../WslcSDK/DebugTransport.cpp
+
     # Volume management
     WSLCVhdVolume.cpp
     WSLCGuestVolume.cpp

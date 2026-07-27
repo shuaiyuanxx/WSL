@@ -352,6 +352,47 @@ try
     m_featureFlags = Settings->FeatureFlags;
     m_pluginNotifier = PluginNotifier;
 
+    // Copy the service debug policy (if any) into an owned structure so it outlives the
+    // synchronous CreateSession/Initialize marshaling. Scoped to the gdb-mi provider for
+    // the Preview; other providers are ignored (ordinary behavior is preserved). The
+    // capability token is secret and is never logged.
+    if (Settings->DebugPolicy != nullptr)
+    {
+        const auto& policy = *Settings->DebugPolicy;
+        const bool providerSupported = policy.ProviderId != nullptr && strcmp(policy.ProviderId, "gdb-mi") == 0;
+        const bool hasEndpoint = policy.Endpoint != nullptr && policy.Endpoint[0] != L'\0';
+        if (providerSupported && hasEndpoint)
+        {
+            auto owned = std::make_unique<WSLCDebugPolicyOwned>();
+            owned->IntentId = policy.IntentId;
+            owned->ProviderId = policy.ProviderId;
+            owned->TargetProgram = policy.TargetProgram != nullptr ? policy.TargetProgram : "";
+            owned->TargetWorkingDirectory = policy.TargetWorkingDirectory != nullptr ? policy.TargetWorkingDirectory : "";
+            owned->DebuggerPath = policy.DebuggerPath != nullptr ? policy.DebuggerPath : "";
+            owned->ImageReference = policy.ImageReference != nullptr ? policy.ImageReference : "";
+            owned->ImageSha256Hex = policy.ImageSha256Hex != nullptr ? policy.ImageSha256Hex : "";
+            owned->Endpoint = policy.Endpoint;
+            memcpy(owned->Token.data(), policy.Token, owned->Token.size());
+            owned->CapabilityTokenHex = DebugTokenToHex(policy.Token);
+            owned->CorrelationId = wsl::shared::string::GuidToString<wchar_t>(policy.IntentId, wsl::shared::string::GuidToStringFlags::None);
+            m_debugPolicy = std::move(owned);
+
+            WSL_LOG(
+                "SessionDebugPolicyClaimed",
+                TraceLoggingValue(m_id, "SessionId"),
+                TraceLoggingValue("gdb-mi", "Provider"),
+                TraceLoggingValue(m_debugPolicy->ImageReference.c_str(), "ImageReference"));
+        }
+        else
+        {
+            WSL_LOG(
+                "SessionDebugPolicyIgnored",
+                TraceLoggingValue(m_id, "SessionId"),
+                TraceLoggingValue(providerSupported, "ProviderSupported"),
+                TraceLoggingValue(hasEndpoint, "HasEndpoint"));
+        }
+    }
+
     // Get user token for the current process
     const auto tokenInfo = wil::get_token_information<TOKEN_USER>(GetCurrentProcessToken());
 
@@ -1997,8 +2038,42 @@ void WSLCSession::CreateContainerImpl(const WSLCContainerOptions* containerOptio
             }
         }
 
+        // If a debug intent was claimed for this session and this container's image matches
+        // the policy image reference, apply the debug transform to a LOCAL copy of the caller
+        // options without mutating caller memory. The transformed init process launches the
+        // guest debugger (e.g. gdb) in gdb-mi mode with stdio available so the per-container
+        // debug transport can relay it to the host DAP session. Ordinary containers (no policy,
+        // or non-matching image) are created exactly as before.
+        const WSLCContainerOptions* effectiveOptions = containerOptions;
+        WSLCContainerOptions transformedOptions{};
+        DebugOptionTransformStorage transformStorage;
+        std::unique_ptr<WSLCDebugPolicyOwned> containerPolicy;
+
+        if (m_debugPolicy && !m_debugPolicy->Consumed && !m_debugPolicy->ImageReference.empty() &&
+            m_debugPolicy->ImageReference == containerOptions->Image)
+        {
+            transformedOptions = *containerOptions;
+            ApplyDebugTransform(*m_debugPolicy, transformedOptions, transformStorage);
+            effectiveOptions = &transformedOptions;
+
+            // The per-container policy is an owned copy so the container fully owns its debug
+            // endpoint/token for its lifetime, independent of the session policy.
+            containerPolicy = std::make_unique<WSLCDebugPolicyOwned>();
+            containerPolicy->IntentId = m_debugPolicy->IntentId;
+            containerPolicy->ProviderId = m_debugPolicy->ProviderId;
+            containerPolicy->TargetProgram = m_debugPolicy->TargetProgram;
+            containerPolicy->TargetWorkingDirectory = m_debugPolicy->TargetWorkingDirectory;
+            containerPolicy->DebuggerPath = m_debugPolicy->DebuggerPath;
+            containerPolicy->ImageReference = m_debugPolicy->ImageReference;
+            containerPolicy->ImageSha256Hex = m_debugPolicy->ImageSha256Hex;
+            containerPolicy->Endpoint = m_debugPolicy->Endpoint;
+            containerPolicy->Token = m_debugPolicy->Token;
+            containerPolicy->CapabilityTokenHex = m_debugPolicy->CapabilityTokenHex;
+            containerPolicy->CorrelationId = m_debugPolicy->CorrelationId;
+        }
+
         auto container = WSLCContainerImpl::Create(
-            *containerOptions,
+            *effectiveOptions,
             containerName,
             *this,
             m_virtualMachine.value(),
@@ -2008,7 +2083,14 @@ void WSLCSession::CreateContainerImpl(const WSLCContainerOptions* containerOptio
             std::bind(&WSLCSession::OnContainerDeleted, this, std::placeholders::_1),
             m_eventTracker.value(),
             m_dockerClient.value(),
-            m_ioRelay);
+            m_ioRelay,
+            std::move(containerPolicy));
+
+        // Bind succeeded: mark the session policy consumed so it applies to exactly one container.
+        if (effectiveOptions == &transformedOptions)
+        {
+            m_debugPolicy->Consumed = true;
+        }
 
         // Key the map by Docker's container ID, which is set in the WSLCContainerImpl constructor and stable for its lifetime.
         auto [it, inserted] = m_containers.emplace(container->ID(), std::move(container));

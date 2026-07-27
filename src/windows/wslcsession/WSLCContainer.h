@@ -28,11 +28,16 @@ Abstract:
 #include "WSLCVhdVolume.h"
 #include <unordered_map>
 
+// Authenticated debug transport implementation (shared with WslcSDK). Forward-declared here so a
+// WSLCContainerImpl can own one via unique_ptr; the full definition is included in the .cpp.
+struct WslcDebugTransportImpl;
+
 namespace wsl::windows::service::wslc {
 
 class WSLCContainer;
 class WSLCSession;
 class WSLCVolumes;
+struct WSLCDebugPolicyOwned;
 
 class unique_com_disconnect
 {
@@ -90,7 +95,8 @@ public:
         WSLCContainerState InitialState,
         std::uint64_t CreatedAt,
         WSLCProcessFlags InitProcessFlags,
-        WSLCContainerFlags ContainerFlags);
+        WSLCContainerFlags ContainerFlags,
+        std::unique_ptr<WSLCDebugPolicyOwned>&& DebugPolicy = nullptr);
 
     ~WSLCContainerImpl();
 
@@ -144,7 +150,8 @@ public:
         std::function<void(const WSLCContainerImpl*)>&& OnDeleted,
         DockerEventTracker& EventTracker,
         DockerHTTPClient& DockerClient,
-        IORelay& Relay);
+        IORelay& Relay,
+        std::unique_ptr<WSLCDebugPolicyOwned>&& DebugPolicy = nullptr);
 
     static std::shared_ptr<WSLCContainerImpl> Open(
         const common::docker_schema::ContainerInfo& DockerContainer,
@@ -224,6 +231,13 @@ private:
     DockerEventTracker::EventTrackingReference m_containerEvents;
     IORelay& m_ioRelay;
     std::string m_networkMode;
+
+    // Debug-controlled container support. m_debugPolicy is non-null only for a container bound to
+    // a claimed debug intent; it owns the endpoint/token/correlation/provider needed to stand up
+    // m_debugTransport in Start(). The transport is stopped before the init process/IO is released
+    // (see ReleaseProcesses / destructor). Guarded by m_processesLock like m_initProcess.
+    std::unique_ptr<WSLCDebugPolicyOwned> m_debugPolicy;
+    __guarded_by(m_processesLock) std::unique_ptr<WslcDebugTransportImpl> m_debugTransport;
 };
 
 class DECLSPEC_UUID("B1F1C4E3-C225-4CAE-AD8A-34C004DE1AE4") WSLCContainer

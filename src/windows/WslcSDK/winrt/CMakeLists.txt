@@ -7,6 +7,7 @@ set(SOURCES
     ContainerPortMapping.cpp
     ContainerSettings.cpp
     ContainerVolume.cpp
+    DebugTransport.cpp
     ImageInfo.cpp
     ImageProgress.cpp
     InstallProgress.cpp
@@ -30,6 +31,7 @@ set(HEADERS
     ContainerPortMapping.h
     ContainerSettings.h
     ContainerVolume.h
+    DebugTransport.h
     Helpers.h
     ImageInfo.h
     ImageProgress.h
@@ -49,7 +51,7 @@ set(HEADERS
 )
 
 add_library(wslcsdkwinrt STATIC ${SOURCES} ${HEADERS})
-add_dependencies(wslcsdkwinrt wslcsdkwinrtidl)
+add_dependencies(wslcsdkwinrt wslcsdkwinrtidl wslserviceidl localization)
 
 set(MODULE_G_CPP ${CMAKE_CURRENT_BINARY_DIR}/${TARGET_PLATFORM}/${CMAKE_BUILD_TYPE}/module.g.cpp)
 target_sources(wslcsdkwinrt PRIVATE ${MODULE_G_CPP})

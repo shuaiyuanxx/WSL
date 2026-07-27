@@ -189,7 +189,9 @@ template <typename Interface>
 wil::com_ptr_t<Interface> CreateComServerAsUser(_In_ REFCLSID RefClsId, _In_ HANDLE UserToken)
 {
     auto revert = wil::impersonate_token(UserToken);
-    return wil::CoCreateInstance<Interface>(RefClsId, (CLSCTX_LOCAL_SERVER | CLSCTX_ENABLE_CLOAKING | CLSCTX_ENABLE_AAA));
+    // Impersonation supplies the activation identity. CLSCTX_ENABLE_AAA breaks per-user
+    // LocalServer activation from the session-0 service when the caller is in an RDP session.
+    return wil::CoCreateInstance<Interface>(RefClsId, (CLSCTX_LOCAL_SERVER | CLSCTX_ENABLE_CLOAKING));
 }
 
 template <typename Class, typename Interface>

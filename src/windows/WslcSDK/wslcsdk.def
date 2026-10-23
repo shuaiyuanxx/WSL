@@ -50,6 +50,8 @@ WslcSetContainerSettingsNamedVolumes
 WslcSetContainerSettingsInitProcess
 WslcSetContainerSettingsFlags
 WslcSetContainerSettingsPortMappings
+WslcSetContainerSettingsCapabilityAdditions
+WslcSetContainerSettingsCapabilityDrops
 
 WslcCreateContainerProcess
 WslcStartContainer
@@ -65,6 +67,7 @@ WslcSetProcessSettingsCallbacks
 WslcSetProcessSettingsWorkingDirectory
 WslcSetProcessSettingsCmdLine
 WslcSetProcessSettingsEnvVariables
+WslcSetProcessSettingsFlags
 WslcGetProcessPid
 WslcGetProcessExitEvent
 WslcGetProcessState

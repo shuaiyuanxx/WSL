@@ -227,10 +227,20 @@ void WSLCContainerLauncher::AddUlimit(const std::string& Name, std::int64_t Soft
     m_ulimits.push_back(ulimit);
 }
 
+void WSLCContainerLauncher::SetCapAdd(std::vector<std::string>&& CapAdd)
+{
+    m_capAdd = std::move(CapAdd);
+}
+
+void WSLCContainerLauncher::SetCapDrop(std::vector<std::string>&& CapDrop)
+{
+    m_capDrop = std::move(CapDrop);
+}
+
 void wsl::windows::common::WSLCContainerLauncher::AddVolume(const std::wstring& HostPath, const std::string& ContainerPath, bool ReadOnly)
 {
     AddMount({
-        .MountType = mount::Type::Bind,
+        .MountType = WSLCMountTypeBind,
         .Source = HostPath,
         .Target = ContainerPath,
         .ReadOnly = ReadOnly,
@@ -241,7 +251,7 @@ void wsl::windows::common::WSLCContainerLauncher::AddVolume(const std::wstring& 
 void wsl::windows::common::WSLCContainerLauncher::AddNamedVolume(const std::string& Name, const std::string& ContainerPath, bool ReadOnly)
 {
     AddMount({
-        .MountType = mount::Type::Volume,
+        .MountType = WSLCMountTypeVolume,
         .Source = wsl::shared::string::MultiByteToWide(Name),
         .Target = ContainerPath,
         .ReadOnly = ReadOnly,
@@ -251,20 +261,7 @@ void wsl::windows::common::WSLCContainerLauncher::AddNamedVolume(const std::stri
 void wsl::windows::common::WSLCContainerLauncher::AddMount(const mount::Spec& Mount)
 {
     WSLCMountSpec mount{};
-    switch (Mount.MountType)
-    {
-    case mount::Type::Bind:
-        mount.Type = WSLCMountTypeBind;
-        break;
-
-    case mount::Type::Volume:
-        mount.Type = WSLCMountTypeVolume;
-        break;
-
-    case mount::Type::Tmpfs:
-        mount.Type = WSLCMountTypeTmpfs;
-        break;
-    }
+    mount.Type = Mount.MountType;
 
     if (!Mount.Source.empty())
     {
@@ -273,9 +270,14 @@ void wsl::windows::common::WSLCContainerLauncher::AddMount(const mount::Spec& Mo
 
     mount.Target = m_mountTargets.emplace_back(Mount.Target).c_str();
     mount.ReadOnly = Mount.ReadOnly ? TRUE : FALSE;
-    if (Mount.MountType == mount::Type::Bind && Mount.BindSource == mount::BindSourcePolicy::CreateIfMissing)
+    if (Mount.MountType == WSLCMountTypeBind && Mount.BindSource == mount::BindSourcePolicy::CreateIfMissing)
     {
         WI_SetFlag(mount.Flags, WSLCMountSpecFlagsCreateSourceIfMissing);
+    }
+
+    if (Mount.ConfigVolume)
+    {
+        WI_SetFlag(mount.Flags, WSLCMountSpecFlagsConfigVolume);
     }
 
     if (Mount.TmpfsSizeBytes.has_value())
@@ -292,7 +294,6 @@ void wsl::windows::common::WSLCContainerLauncher::AddMount(const mount::Spec& Mo
 
     if (Mount.TmpfsOptions.has_value())
     {
-        WI_SetFlag(mount.Flags, WSLCMountSpecFlagsTmpfsOptions);
         mount.TmpfsOptions = m_mountTmpfsOptions.emplace_back(Mount.TmpfsOptions.value()).c_str();
     }
 
@@ -315,7 +316,7 @@ void wsl::windows::common::WSLCContainerLauncher::AddLabel(const std::string& Ke
 void wsl::windows::common::WSLCContainerLauncher::AddTmpfs(const std::string& ContainerPath, const std::string& Options)
 {
     AddMount({
-        .MountType = mount::Type::Tmpfs,
+        .MountType = WSLCMountTypeTmpfs,
         .Target = ContainerPath,
         .TmpfsOptions = Options,
     });
@@ -511,6 +512,29 @@ std::pair<HRESULT, std::optional<RunningWSLCContainer>> WSLCContainerLauncher::C
     options.UlimitsCount = static_cast<ULONG>(m_ulimits.size());
     options.Ulimits = m_ulimits.size() > 0 ? m_ulimits.data() : nullptr;
 
+    std::vector<const char*> capAddStorage;
+    for (const auto& capability : m_capAdd)
+    {
+        capAddStorage.push_back(capability.c_str());
+    }
+
+    if (!capAddStorage.empty())
+    {
+        options.CapAdd = {capAddStorage.data(), static_cast<ULONG>(capAddStorage.size())};
+    }
+
+    std::vector<const char*> capDropStorage;
+    capDropStorage.reserve(m_capDrop.size());
+    for (const auto& capability : m_capDrop)
+    {
+        capDropStorage.push_back(capability.c_str());
+    }
+
+    if (!capDropStorage.empty())
+    {
+        options.CapDrop = {capDropStorage.data(), static_cast<ULONG>(capDropStorage.size())};
+    }
+
     // TODO: Support volumes, ports, flags, container networking mode, etc.
     wil::com_ptr<IWSLCContainer> container;
     auto result = Session.CreateContainer(&options, WarningCallback, &container);
@@ -541,7 +565,7 @@ RunningWSLCContainer WSLCContainerLauncher::Launch(IWSLCSession& Session, WSLCCo
 wsl::windows::common::wslc_schema::InspectContainer RunningWSLCContainer::Inspect()
 {
     wil::unique_cotaskmem_ansistring output;
-    THROW_IF_FAILED(m_container->Inspect(&output));
+    THROW_IF_FAILED(m_container->Inspect(FALSE, &output));
 
     return wsl::shared::FromJson<wslc_schema::InspectContainer>(output.get());
 }

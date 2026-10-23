@@ -37,6 +37,7 @@ using wsl::windows::common::io::HTTPChunkBasedReadHandle;
 using wsl::windows::common::io::OverlappedIOHandle;
 using wsl::windows::common::io::ReadHandle;
 using wsl::windows::common::io::RelayHandle;
+using wsl::windows::service::wslc::CleanContainerName;
 using wsl::windows::service::wslc::ContainerPortMapping;
 using wsl::windows::service::wslc::DockerEventTracker;
 using wsl::windows::service::wslc::DockerHTTPClient;
@@ -54,7 +55,6 @@ using wsl::windows::service::wslc::WSLCContainerMetadata;
 using wsl::windows::service::wslc::WSLCContainerMetadataLabel;
 using wsl::windows::service::wslc::WSLCContainerMetadataV1;
 using wsl::windows::service::wslc::WSLCExecutionContext;
-using wsl::windows::service::wslc::WSLCPortMapping;
 using wsl::windows::service::wslc::WSLCSession;
 using wsl::windows::service::wslc::WSLCVirtualMachine;
 using wsl::windows::service::wslc::WSLCVolumeMount;
@@ -138,7 +138,7 @@ std::pair<uint16_t, int> ParseExposedPortKey(const std::string& key)
 // TODO: Remove once the port relay can allocate ephemeral ports.
 uint16_t AllocateEphemeralPort(int family, const char* address)
 {
-    wil::unique_socket sock(socket(family, SOCK_STREAM, IPPROTO_TCP));
+    wil::unique_socket sock(::socket(family, SOCK_STREAM, IPPROTO_TCP));
     THROW_LAST_ERROR_IF(!sock);
 
     SOCKADDR_INET addr{};
@@ -430,15 +430,14 @@ auto MountVolumes(std::vector<WSLCVolumeMount>& volumes, WSLCVirtualMachine& par
         const auto sourceExists = std::filesystem::exists(volume.HostPath, error);
         if (error)
         {
-            throw wsl::windows::common::mount::MountValidationException(
-                Localization::MessageWslcBindSourcePathError(volume.HostPath, error.message()));
+            THROW_HR_WITH_USER_ERROR(E_INVALIDARG, Localization::MessageWslcBindSourcePathError(volume.HostPath, error.message()));
         }
 
         if (!sourceExists)
         {
             if (!volume.CreateSourceIfMissing)
             {
-                throw wsl::windows::common::mount::MountValidationException(Localization::MessageWslcBindSourcePathNotFound(volume.HostPath));
+                THROW_HR_WITH_USER_ERROR(E_INVALIDARG, Localization::MessageWslcBindSourcePathNotFound(volume.HostPath));
             }
 
             auto result = wil::CreateDirectoryDeepNoThrow(volume.HostPath.c_str());
@@ -455,18 +454,6 @@ auto MountVolumes(std::vector<WSLCVolumeMount>& volumes, WSLCVirtualMachine& par
     }
 
     return std::move(errorCleanup);
-}
-
-auto MountVolumesWithUserError(std::vector<WSLCVolumeMount>& volumes, WSLCVirtualMachine& parentVM)
-{
-    try
-    {
-        return MountVolumes(volumes, parentVM);
-    }
-    catch (const wsl::windows::common::mount::MountValidationException& ex)
-    {
-        THROW_HR_WITH_USER_ERROR(E_INVALIDARG, ex.Reason());
-    }
 }
 
 WSLCContainerState DockerStateToWSLCState(ContainerState state)
@@ -488,15 +475,20 @@ WSLCContainerState DockerStateToWSLCState(ContainerState state)
     }
 }
 
-std::string CleanContainerName(const std::string& name)
+std::string WSLCStateToEventAction(WSLCContainerState state)
 {
-    // Docker container names have a leading '/', strip it.
-    if (!name.empty() && name[0] == '/')
+    switch (state)
     {
-        return name.substr(1);
+    case WslcContainerStateRunning:
+        return "start";
+    case WslcContainerStateExited:
+        return "die";
+    case WslcContainerStateDeleted:
+        return "destroy";
+    default:
+        WI_ASSERT(false);
+        return "unknown";
     }
-
-    return name;
 }
 
 std::string ExtractContainerName(const std::vector<std::string>& names, const std::string& id)
@@ -546,6 +538,9 @@ std::map<std::string, std::string> StripInternalLabels(std::optional<std::map<st
     return StripInternalLabels(std::move(labels).value_or(std::map<std::string, std::string>{}));
 }
 
+// Validate every mount representation as one collection before preparing VM shares or calling Docker.
+// Docker handles duplicate destinations differently across Binds, Mounts, and Tmpfs and can create named volumes while processing the request.
+// This service-boundary check gives every caller consistent duplicate semantics and keeps invalid requests side-effect free.
 std::vector<wsl::windows::common::mount::Spec> ConvertAndValidateMounts(const WSLCContainerOptions& containerOptions)
 {
     namespace mount = wsl::windows::common::mount;
@@ -565,39 +560,36 @@ std::vector<wsl::windows::common::mount::Spec> ConvertAndValidateMounts(const WS
             i,
             value.Flags);
 
-        mount::Type type;
         switch (value.Type)
         {
         case WSLCMountTypeBind:
-            type = mount::Type::Bind;
-            break;
-
         case WSLCMountTypeVolume:
-            type = mount::Type::Volume;
-            break;
-
         case WSLCMountTypeTmpfs:
-            type = mount::Type::Tmpfs;
             break;
 
         default:
             THROW_HR_MSG(E_INVALIDARG, "Mount at index %lu has invalid type: %d", i, value.Type);
         }
 
+        const auto type = value.Type;
         THROW_HR_IF_MSG(
             E_INVALIDARG,
-            type != mount::Type::Bind && WI_IsFlagSet(value.Flags, WSLCMountSpecFlagsCreateSourceIfMissing),
+            type != WSLCMountTypeBind && WI_IsFlagSet(value.Flags, WSLCMountSpecFlagsCreateSourceIfMissing),
             "Mount at index %lu specifies create-source-if-missing for a non-bind mount",
             i);
         THROW_HR_IF_MSG(
             E_INVALIDARG,
-            type != mount::Type::Tmpfs && WI_IsFlagSet(value.Flags, WSLCMountSpecFlagsTmpfsOptions),
+            type != WSLCMountTypeVolume && WI_IsFlagSet(value.Flags, WSLCMountSpecFlagsConfigVolume),
+            "Mount at index %lu specifies config-volume for a non-volume mount",
+            i);
+        THROW_HR_IF_MSG(
+            E_INVALIDARG,
+            type != WSLCMountTypeTmpfs && value.TmpfsOptions != nullptr,
             "Mount at index %lu specifies tmpfs options for a non-tmpfs mount",
             i);
         THROW_HR_IF_MSG(
             E_INVALIDARG,
-            WI_IsFlagSet(value.Flags, WSLCMountSpecFlagsTmpfsOptions) &&
-                WI_IsAnyFlagSet(value.Flags, WSLCMountSpecFlagsTmpfsSize | WSLCMountSpecFlagsTmpfsMode),
+            value.TmpfsOptions != nullptr && WI_IsAnyFlagSet(value.Flags, WSLCMountSpecFlagsTmpfsSize | WSLCMountSpecFlagsTmpfsMode),
             "Mount at index %lu combines legacy and structured tmpfs options",
             i);
 
@@ -610,9 +602,8 @@ std::vector<wsl::windows::common::mount::Spec> ConvertAndValidateMounts(const WS
                                                                                              : mount::BindSourcePolicy::RequireExisting,
             .TmpfsSizeBytes = WI_IsFlagSet(value.Flags, WSLCMountSpecFlagsTmpfsSize) ? std::optional<int64_t>{value.TmpfsSizeBytes} : std::nullopt,
             .TmpfsMode = WI_IsFlagSet(value.Flags, WSLCMountSpecFlagsTmpfsMode) ? std::optional<uint32_t>{value.TmpfsMode} : std::nullopt,
-            .TmpfsOptions = WI_IsFlagSet(value.Flags, WSLCMountSpecFlagsTmpfsOptions)
-                                ? std::optional<std::string>{value.TmpfsOptions != nullptr ? value.TmpfsOptions : ""}
-                                : std::nullopt,
+            .TmpfsOptions = value.TmpfsOptions != nullptr ? std::optional<std::string>{value.TmpfsOptions} : std::nullopt,
+            .ConfigVolume = WI_IsFlagSet(value.Flags, WSLCMountSpecFlagsConfigVolume),
         });
     }
 
@@ -621,7 +612,7 @@ std::vector<wsl::windows::common::mount::Spec> ConvertAndValidateMounts(const WS
         mount::ValidateMountCollection(mounts);
         for (const auto& mount : mounts)
         {
-            if (mount.MountType == mount::Type::Bind)
+            if (mount.MountType == WSLCMountTypeBind)
             {
                 if (mount.BindSource == mount::BindSourcePolicy::CreateIfMissing)
                 {
@@ -666,7 +657,10 @@ std::vector<wsl::windows::common::mount::Spec> ConvertAndValidateMounts(const WS
 
     for (const auto& mount : mounts)
     {
-        addDestination(mount.Target.c_str());
+        if (!mount.ConfigVolume)
+        {
+            addDestination(mount.Target.c_str());
+        }
     }
 
     THROW_HR_IF(E_INVALIDARG, containerOptions.VolumesCount > 0 && containerOptions.Volumes == nullptr);
@@ -706,35 +700,28 @@ enum class MissingBindSource
 
 PreparedBindMount PrepareBindMount(const std::wstring& source, const std::string& target, bool readOnly, MissingBindSource missingSource)
 {
-    GUID volumeId;
-    THROW_IF_FAILED(CoCreateGuid(&volumeId));
-
-    auto parentVMPath = std::format("/mnt/{}", wsl::shared::string::GuidToString<char>(volumeId));
     std::filesystem::path hostPath = source;
     THROW_HR_WITH_USER_ERROR_IF(E_INVALIDARG, Localization::MessagePathNotAbsolute(source), !hostPath.is_absolute());
 
     std::wstring sourceFilename;
     {
         std::error_code ec;
-        hostPath = std::filesystem::canonical(hostPath, ec);
-        if (!ec)
+        hostPath = wsl::windows::common::filesystem::GetCanonicalPath(hostPath, ec);
+        if (ec)
         {
-            if (std::filesystem::is_regular_file(hostPath))
-            {
-                sourceFilename = hostPath.filename().wstring();
-                hostPath = hostPath.parent_path();
-            }
+            THROW_HR_WITH_USER_ERROR(HRESULT_FROM_WIN32(ec.value()), Localization::MessageWslcFailedToMountVolume(source, ec.message()));
         }
-        else if (ec == std::errc::no_such_file_or_directory)
+
+        if (std::filesystem::is_regular_file(hostPath))
         {
-            hostPath = source;
-        }
-        else
-        {
-            THROW_HR_WITH_USER_ERROR(E_FAIL, Localization::MessageWslcFailedToMountVolume(source, ec.message()));
+            sourceFilename = hostPath.filename().wstring();
+            hostPath = hostPath.parent_path();
         }
     }
 
+    GUID volumeId;
+    THROW_IF_FAILED(CoCreateGuid(&volumeId));
+    auto parentVMPath = std::format("/mnt/{}", wsl::shared::string::GuidToString<char>(volumeId));
     auto dockerSource = sourceFilename.empty() ? parentVMPath : std::format("{}/{}", parentVMPath, sourceFilename);
     return {
         .Volume =
@@ -771,6 +758,17 @@ void ProcessNamedVolumes(const WSLCContainerOptions& containerOptions, wsl::wind
 }
 
 } // namespace
+
+std::string wsl::windows::service::wslc::CleanContainerName(const std::string& name)
+{
+    // Docker container names have a leading '/', strip it.
+    if (!name.empty() && name[0] == '/')
+    {
+        return name.substr(1);
+    }
+
+    return name;
+}
 
 ContainerPortMapping::ContainerPortMapping(VMPortMapping&& VmMapping, uint16_t ContainerPort) :
     VmMapping(std::move(VmMapping)), ContainerPort(ContainerPort)
@@ -818,9 +816,9 @@ unique_com_disconnect::~unique_com_disconnect() noexcept
     }
 }
 
-WSLCPortMapping ContainerPortMapping::Serialize() const
+wsl::windows::service::wslc::WSLCPortMapping ContainerPortMapping::Serialize() const
 {
-    return WSLCPortMapping{
+    return wsl::windows::service::wslc::WSLCPortMapping{
         .HostPort = VmMapping.HostPort(),
         .VmPort = VmMapping.VmPort ? VmMapping.VmPort->Port() : ContainerPort,
         .ContainerPort = ContainerPort,
@@ -842,6 +840,7 @@ WSLCContainerImpl::WSLCContainerImpl(
     std::vector<ContainerPortMapping>&& ports,
     std::map<std::string, std::string>&& labels,
     std::function<void(const WSLCContainerImpl*)>&& onDeleted,
+    EventStore& eventStore,
     WSLCContainerState InitialState,
     std::int64_t CreatedAt,
     WSLCProcessFlags InitProcessFlags,
@@ -857,9 +856,10 @@ WSLCContainerImpl::WSLCContainerImpl(
     m_namedVolumes(std::move(namedVolumes)),
     m_mappedPorts(std::move(ports)),
     m_labels(std::move(labels)),
-    m_comWrapper(wil::MakeOrThrow<WSLCContainer>(wslcSession, std::move(onDeleted))),
+    m_comWrapper(wil::MakeOrThrow<WSLCContainer>(wslcSession, m_id, m_name, InitialState, std::move(onDeleted))),
     m_containerEvents(runtime.Events().RegisterContainerStateUpdates(
-        m_id, std::bind(&WSLCContainerImpl::OnEvent, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3))),
+        m_id, std::bind(&WSLCContainerImpl::OnEvent, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4))),
+    m_eventStore(eventStore),
     m_state(InitialState),
     m_createdAt(CreatedAt),
     m_initProcessFlags(InitProcessFlags),
@@ -959,7 +959,7 @@ const std::string& WSLCContainerImpl::Name() const noexcept
     return m_name;
 }
 
-std::vector<WSLCPortMapping> WSLCContainerImpl::GetPorts() const
+std::vector<wsl::windows::service::wslc::WSLCPortMapping> WSLCContainerImpl::GetPorts() const
 {
     auto lock = m_lock.lock_shared();
     if (m_state != WslcContainerStateRunning)
@@ -967,7 +967,7 @@ std::vector<WSLCPortMapping> WSLCContainerImpl::GetPorts() const
         return {};
     }
 
-    std::vector<WSLCPortMapping> result;
+    std::vector<wsl::windows::service::wslc::WSLCPortMapping> result;
     result.reserve(m_mappedPorts.size());
     for (const auto& port : m_mappedPorts)
     {
@@ -1003,11 +1003,12 @@ void WSLCContainerImpl::Attach(LPCSTR DetachKeys, WSLCHandle* Stdin, WSLCHandle*
 
     THROW_HR_WITH_USER_ERROR_IF(WSLC_E_CONTAINER_NOT_RUNNING, Localization::MessageWslcContainerNotRunning(m_id.c_str()), m_state != WslcContainerStateRunning);
 
-    wil::unique_socket ioHandle;
+    wil::shared_socket ioHandle;
 
     try
     {
-        ioHandle = m_runtime.Docker().AttachContainer(m_id, DetachKeys == nullptr ? std::nullopt : std::optional<std::string>(DetachKeys));
+        ioHandle = wil::shared_socket{
+            m_runtime.Docker().AttachContainer(m_id, DetachKeys == nullptr ? std::nullopt : std::optional<std::string>(DetachKeys))};
     }
     CATCH_AND_THROW_DOCKER_USER_ERROR("Failed to attach to container '%hs'", m_id.c_str());
 
@@ -1029,14 +1030,13 @@ void WSLCContainerImpl::Attach(LPCSTR DetachKeys, WSLCHandle* Stdin, WSLCHandle*
     std::vector<std::unique_ptr<OverlappedIOHandle>> handles;
 
     // This is required for docker to know when stdin is closed.
-    auto onInputComplete = [handle = ioHandle.get()]() { LOG_LAST_ERROR_IF(shutdown(handle, SD_SEND) == SOCKET_ERROR); };
+    auto onInputComplete = [ioHandle]() { LOG_LAST_ERROR_IF(shutdown(ioHandle.get(), SD_SEND) == SOCKET_ERROR); };
 
-    // N.B. Ownership of the io handle is given to the DockerIORelayHandle relay, so it can be closed when docker closes the connection.
-    handles.emplace_back(
-        std::make_unique<RelayHandle<ReadHandle>>(HandleWrapper{std::move(stdinRead), std::move(onInputComplete)}, ioHandle.get()));
+    handles.emplace_back(std::make_unique<RelayHandle<ReadHandle>>(
+        HandleWrapper{std::move(stdinRead), std::move(onInputComplete)}, HandleWrapper{ioHandle}));
 
     handles.emplace_back(std::make_unique<DockerIORelayHandle>(
-        std::move(ioHandle), std::move(stdoutWrite), std::move(stderrWrite), DockerIORelayHandle::Format::Raw));
+        HandleWrapper{ioHandle}, std::move(stdoutWrite), std::move(stderrWrite), DockerIORelayHandle::Format::Raw));
 
     m_runtime.Relay()->AddHandles(std::move(handles));
 
@@ -1049,10 +1049,19 @@ void WSLCContainerImpl::Attach(LPCSTR DetachKeys, WSLCHandle* Stdin, WSLCHandle*
 
 void WSLCContainerImpl::Start(WSLCContainerStartFlags Flags, const WSLCProcessStartOptions* StartOptions)
 {
+    StartPhase(Flags, StartOptions, false);
+}
+
+void WSLCContainerImpl::StartPhase(WSLCContainerStartFlags Flags, const WSLCProcessStartOptions* StartOptions, bool RestartPhase)
+{
     std::shared_ptr<StateTransition> transition;
     auto lifecycleLock = m_lifecycleLock.lock_shared();
     auto lock = m_lock.lock_exclusive();
-    WaitForConflictingTransitionToComplete(lock, lifecycleLock);
+
+    WaitForConflictingTransitionToComplete(lock, lifecycleLock, std::nullopt, !RestartPhase);
+
+    // A Delete() that raced a restart may have already moved the container to the Deleted state.
+    THROW_HR_WITH_USER_ERROR_IF(WSLC_E_CONTAINER_DELETED, Localization::MessageWslcContainerDeleted(m_id), m_state == WslcContainerStateDeleted);
 
     THROW_HR_WITH_USER_ERROR_IF(WSLC_E_CONTAINER_IS_RUNNING, Localization::MessageWslcContainerIsRunning(m_id), m_state == WslcContainerStateRunning);
 
@@ -1086,13 +1095,11 @@ void WSLCContainerImpl::Start(WSLCContainerStartFlags Flags, const WSLCProcessSt
         {
             if (WI_IsFlagSet(m_initProcessFlags, WSLCProcessFlagsTty))
             {
-                io = std::make_unique<TTYProcessIO>(TypedHandle{
-                    wil::unique_handle{(HANDLE)m_runtime.Docker().AttachContainer(m_id, detachKeys).release()}, WSLCHandleTypeSocket});
+                io = std::make_unique<TTYProcessIO>(TypedHandle{m_runtime.Docker().AttachContainer(m_id, detachKeys), WSLCHandleTypeSocket});
             }
             else
             {
-                wil::unique_handle stream{reinterpret_cast<HANDLE>(m_runtime.Docker().AttachContainer(m_id, detachKeys).release())};
-                io = CreateRelayedProcessIO(std::move(stream), m_initProcessFlags);
+                io = CreateRelayedProcessIO(wil::shared_socket{m_runtime.Docker().AttachContainer(m_id, detachKeys)}, m_initProcessFlags);
             }
         }
     }
@@ -1108,12 +1115,14 @@ void WSLCContainerImpl::Start(WSLCContainerStartFlags Flags, const WSLCProcessSt
         std::lock_guard processesLock{m_processesLock};
         m_initProcessControl = control.get();
         m_initProcess = wil::MakeOrThrow<WSLCProcess>(std::move(control), std::move(io), m_initProcessFlags);
+        m_comWrapper->CacheState(m_state, m_initProcess);
     }
 
     auto cleanup = wil::scope_exit_log(WI_DIAGNOSTICS_INFO, [this]() mutable {
         std::lock_guard processesLock{m_processesLock};
         m_initProcess.Reset();
         m_initProcessControl = nullptr;
+        m_comWrapper->CacheState(m_state, m_initProcess);
     });
 
     // Refuse to start if any referenced named volume is in a failed state.
@@ -1133,10 +1142,22 @@ void WSLCContainerImpl::Start(WSLCContainerStartFlags Flags, const WSLCProcessSt
         Localization::MessageWslcVolumeNotAvailable(wsl::shared::string::Join(unavailableVolumes, ',')),
         !unavailableVolumes.empty());
 
-    auto volumeCleanup = MountVolumesWithUserError(m_mountedVolumes, m_runtime.Vm());
+    // A restart keeps its ports and mounts across both phases, so re-acquiring them here would collide
+    // with the container's own reservations. Release them if the start does not land, since an exited
+    // container must not keep holding them.
+    auto resourceCleanup = wil::scope_exit_log(WI_DIAGNOSTICS_INFO, [this]() { ReleaseRuntimeResources(); });
 
-    auto portCleanup = wil::scope_exit_log(WI_DIAGNOSTICS_INFO, [this]() { UnmapPorts(); });
-    MapPorts();
+    if (!m_runtimeResourcesHeld)
+    {
+        // An in-flight archive operation may already hold the mounts; adopt them in that case.
+        if (m_archiveMountUsers == 0)
+        {
+            MountVolumes(m_mountedVolumes, m_runtime.Vm()).release();
+        }
+
+        MapPorts();
+        m_runtimeResourcesHeld = true;
+    }
 
     try
     {
@@ -1184,8 +1205,7 @@ void WSLCContainerImpl::Start(WSLCContainerStartFlags Flags, const WSLCProcessSt
 
     transition = StartTransition(TransitionKind::Start, ContainerEvent::Start);
 
-    portCleanup.release();
-    volumeCleanup.release();
+    resourceCleanup.release();
     cleanup.release();
 
     lock.reset();
@@ -1194,15 +1214,28 @@ void WSLCContainerImpl::Start(WSLCContainerStartFlags Flags, const WSLCProcessSt
 }
 
 void WSLCContainerImpl::WaitForConflictingTransitionToComplete(
-    wil::rwlock_release_exclusive_scope_exit& lock, wil::rwlock_release_shared_scope_exit& lifecycleLock, std::optional<TransitionKind> kind)
+    wil::rwlock_release_exclusive_scope_exit& lock, wil::rwlock_release_shared_scope_exit& lifecycleLock, std::optional<TransitionKind> kind, bool waitForRestart)
 {
-    while (m_transition && (!kind.has_value() || m_transition->Kind != kind.value()))
+    while (true)
     {
+        // A restart spans two transitions, so waiting on the one in flight is not enough.
+        if (waitForRestart && m_restart)
+        {
+            auto restart = m_restart;
+            lock.reset();
+            lifecycleLock.reset();
+            WaitForCompletionEvent(restart->Completed.get());
+        }
+        else if (m_transition && (!kind.has_value() || m_transition->Kind != kind.value()))
         {
             auto transition = m_transition;
             lock.reset();
             lifecycleLock.reset();
             WaitForTransitionCompletion(transition);
+        }
+        else
+        {
+            return;
         }
 
         lifecycleLock = m_lifecycleLock.lock_shared();
@@ -1219,11 +1252,16 @@ __requires_exclusive_lock_held(m_lock) std::shared_ptr<WSLCContainerImpl::StateT
     return transition;
 }
 
-void WSLCContainerImpl::WaitForTransitionCompletion(const std::shared_ptr<StateTransition>& transition) const
+void WSLCContainerImpl::WaitForCompletionEvent(HANDLE Event) const
 {
     auto io = m_wslcSession.CreateIOContext();
-    io.AddHandle(std::make_unique<EventHandle>(transition->Completed.get()));
+    io.AddHandle(std::make_unique<EventHandle>(Event));
     io.Run({});
+}
+
+void WSLCContainerImpl::WaitForTransitionCompletion(const std::shared_ptr<StateTransition>& transition) const
+{
+    WaitForCompletionEvent(transition->Completed.get());
 
     WI_ASSERT(transition->Completed.is_signaled());
 }
@@ -1254,25 +1292,103 @@ __requires_exclusive_lock_held(m_lock) void WSLCContainerImpl::CompleteTransitio
     transition->Completed.SetEvent();
 }
 
-void WSLCContainerImpl::OnEvent(ContainerEvent event, std::optional<int> exitCode, std::int64_t eventTime) noexcept
+std::map<std::string, std::string> WSLCContainerImpl::BuildEventAttributes() const
+{
+    auto attributes = StripInternalLabels(m_labels);
+    attributes["name"] = m_name;
+    attributes["image"] = m_image;
+    return attributes;
+}
+
+void WSLCContainerImpl::RecordEvent(std::string&& Action, std::int64_t TimeNano) noexcept
+try
+{
+    m_eventStore.Record("container", std::move(Action), m_id, BuildEventAttributes(), TimeNano);
+}
+CATCH_LOG()
+
+void WSLCContainerImpl::RecordEvent(std::string&& Action, std::int64_t TimeNano, const std::map<std::string, std::string>& DockerAttributes) noexcept
+try
+{
+    auto attributes = GetEventAttributes(DockerAttributes);
+
+    // Containers are only tracked once created or opened with WSLC's metadata label, which Docker copies into every event.
+    WI_ASSERT(attributes.has_value());
+
+    m_eventStore.Record("container", std::move(Action), m_id, std::move(attributes.value()), TimeNano);
+}
+CATCH_LOG()
+
+std::optional<std::map<std::string, std::string>> WSLCContainerImpl::GetEventAttributes(std::map<std::string, std::string> DockerAttributes)
+{
+    // Containers WSLC didn't create, such as BuildKit's, carry no metadata and aren't reported.
+    const auto metadataIt = DockerAttributes.find(WSLCContainerMetadataLabel);
+    if (metadataIt == DockerAttributes.end())
+    {
+        return std::nullopt;
+    }
+
+    auto metadata = ParseContainerMetadata(metadataIt->second);
+    auto attributes = StripInternalLabels(std::move(DockerAttributes));
+
+    // Docker reports the image ID when the container was created from a resolved image (e.g. publish-all).
+    if (!metadata.Image.empty())
+    {
+        attributes["image"] = std::move(metadata.Image);
+    }
+
+    return attributes;
+}
+
+void WSLCContainerImpl::OnEvent(ContainerEvent event, std::optional<int> exitCode, const std::map<std::string, std::string>& attributes, std::int64_t eventTimeNano) noexcept
 {
     // Either owner may disconnect the COM wrapper, so both must outlive m_lock.
     unique_com_disconnect comWrapper;
     std::shared_ptr<StateTransition> transition;
+
+    switch (event)
+    {
+    case ContainerEvent::HealthHealthy:
+        RecordEvent("health_status: healthy", eventTimeNano, attributes);
+        return;
+
+    case ContainerEvent::HealthUnhealthy:
+        RecordEvent("health_status: unhealthy", eventTimeNano, attributes);
+        return;
+
+    case ContainerEvent::Kill:
+        RecordEvent("kill", eventTimeNano, attributes);
+        return;
+
+    default:
+        break;
+    }
 
     {
         auto lifecycleLock = m_lifecycleLock.lock_exclusive();
         auto lock = m_lock.lock_exclusive();
         transition = m_transition;
 
-        if (event == ContainerEvent::Start)
+        if (event == ContainerEvent::Stop)
+        {
+            // Docker can report 'stop' before 'die', so it's published with the exit transition instead.
+            if (m_state == WslcContainerStateRunning)
+            {
+                m_pendingStopAttributes = attributes;
+            }
+            else
+            {
+                RecordEvent("stop", eventTimeNano, attributes);
+            }
+        }
+        else if (event == ContainerEvent::Start)
         {
             // Only WSLC should start the container, so if we receive a start event, it must be expected by a transition.
             // Otherwise the container was started externally. Log if the container was started externally.
             if (transition && transition->ExpectedEvent == ContainerEvent::Start)
             {
                 WI_ASSERT(m_state == WslcContainerStateCreated || m_state == WslcContainerStateExited);
-                CommitState(WslcContainerStateRunning, eventTime);
+                CommitState(WslcContainerStateRunning, eventTimeNano, attributes);
                 CompleteTransition(transition);
             }
             else
@@ -1280,16 +1396,16 @@ void WSLCContainerImpl::OnEvent(ContainerEvent event, std::optional<int> exitCod
                 WSL_LOG("UnexpectedContainerStart", TraceLoggingValue(m_id.c_str(), "Id"));
             }
         }
-        else if (event == ContainerEvent::Stop)
+        else if (event == ContainerEvent::Exit)
         {
             WI_ASSERT(exitCode.has_value());
-            OnStopped(exitCode.value(), eventTime);
+            OnStopped(exitCode.value(), attributes, eventTimeNano);
         }
         else if (event == ContainerEvent::Destroy)
         {
             if (m_state != WslcContainerStateDeleted)
             {
-                CommitState(WslcContainerStateDeleted, eventTime);
+                CommitState(WslcContainerStateDeleted, eventTimeNano, attributes);
                 comWrapper = ReleaseResources();
             }
 
@@ -1317,12 +1433,24 @@ void WSLCContainerImpl::OnEvent(ContainerEvent event, std::optional<int> exitCod
 
 void WSLCContainerImpl::Stop(WSLCSignal Signal, LONG TimeoutSeconds, bool Kill)
 {
+    StopPhase(Signal, TimeoutSeconds, Kill, false);
+}
+
+void WSLCContainerImpl::StopPhase(WSLCSignal Signal, LONG TimeoutSeconds, bool Kill, bool RestartPhase)
+{
     std::shared_ptr<StateTransition> transition;
 
     {
         auto lifecycleLock = m_lifecycleLock.lock_shared();
         auto lock = m_lock.lock_exclusive();
-        WaitForConflictingTransitionToComplete(lock, lifecycleLock, TransitionKind::Stop);
+
+        // Kill is the escape hatch when a restart's stop phase is stuck, so it must not wait on the very
+        // restart it is meant to unblock. Landing between the phases finds the container exited, which is
+        // turned away below like any other kill of a stopped container.
+        WaitForConflictingTransitionToComplete(lock, lifecycleLock, TransitionKind::Stop, !RestartPhase && !Kill);
+
+        // A Delete() that raced a restart may have already moved the container to the Deleted state.
+        THROW_HR_WITH_USER_ERROR_IF(WSLC_E_CONTAINER_DELETED, Localization::MessageWslcContainerDeleted(m_id), m_state == WslcContainerStateDeleted);
 
         transition = m_transition;
         WI_ASSERT(!transition || transition->Kind == TransitionKind::Stop);
@@ -1358,7 +1486,7 @@ void WSLCContainerImpl::Stop(WSLCSignal Signal, LONG TimeoutSeconds, bool Kill)
             ValidateStopTimeout(TimeoutSeconds, true);
 
             // Don't wait for the container to stop if we're not sending SIGKILL, since it may not stop the container.
-            // N.B. If the signal was SIGTERM for instance, we'll receive the stop notification via OnEvent().
+            // N.B. If the signal was SIGTERM for instance, we'll receive the exit notification via OnEvent().
             bool waitForStop = !Kill || (SignalArg.value_or(WSLCSignalSIGKILL) == WSLCSignalSIGKILL);
             const auto generation = m_stateGeneration;
 
@@ -1388,6 +1516,14 @@ void WSLCContainerImpl::Stop(WSLCSignal Signal, LONG TimeoutSeconds, bool Kill)
                 // HTTP 304 is returned when the container is already stopped.
                 if (Kill || e.StatusCode() != 304)
                 {
+                    lock = m_lock.lock_exclusive();
+
+                    // A force delete can win the locks released above, so the container may be gone rather than stuck.
+                    THROW_HR_WITH_USER_ERROR_IF(
+                        WSLC_E_CONTAINER_DELETED,
+                        Localization::MessageWslcContainerDeleted(m_id),
+                        m_state == WslcContainerStateDeleted || (m_transition && m_transition->ExpectedEvent == ContainerEvent::Destroy));
+
                     THROW_DOCKER_USER_ERROR_MSG(e, "Failed to %hs container '%hs'", Kill ? "kill" : "stop", m_id.c_str());
                 }
             }
@@ -1398,12 +1534,12 @@ void WSLCContainerImpl::Stop(WSLCSignal Signal, LONG TimeoutSeconds, bool Kill)
                 transition = m_transition;
 
                 // The container can exit and start again while the locks are released, so an unchanged generation is
-                // the only proof that the stop event this call is waiting for is still to come.
+                // the only proof that the exit event this call is waiting for is still to come.
                 if (m_stateGeneration == generation)
                 {
                     if (!transition)
                     {
-                        transition = StartTransition(TransitionKind::Stop, ContainerEvent::Stop);
+                        transition = StartTransition(TransitionKind::Stop, ContainerEvent::Exit);
                     }
                 }
                 // The run already ended: keep waiting on the work it triggered (e.g. auto-remove), never on a start
@@ -1426,11 +1562,98 @@ void WSLCContainerImpl::Stop(WSLCSignal Signal, LONG TimeoutSeconds, bool Kill)
     }
 }
 
-__requires_exclusive_lock_held(m_lock) void WSLCContainerImpl::OnStopped(int exitCode, std::optional<std::int64_t> stopTimestamp)
+void WSLCContainerImpl::Restart(WSLCSignal Signal, LONG TimeoutSeconds)
+{
+    // The stop phase is skipped when the container is not running, so it cannot be the only validation.
+    ValidateStopTimeout(TimeoutSeconds, true);
+
+    bool wasRunning{};
+    auto restart = std::make_shared<RestartTransaction>();
+
+    {
+        auto lifecycleLock = m_lifecycleLock.lock_shared();
+        auto lock = m_lock.lock_exclusive();
+        WaitForConflictingTransitionToComplete(lock, lifecycleLock);
+
+        wasRunning = m_state == WslcContainerStateRunning;
+
+        // N.B. Stop() and Start() each take m_lock, so it cannot be held across both phases. m_restart
+        // stands them down until the start phase commits Running instead.
+        m_restart = restart;
+    }
+
+    // N.B. Nothing between here and the cleanup below may throw — nothing clears m_restart until it is armed.
+    bool succeeded = false;
+    auto cleanup = wil::scope_exit_log(WI_DIAGNOSTICS_INFO, [this, restart, &succeeded]() {
+        // N.B. Signalled last so a waiter cannot observe the restart as complete before the failure
+        // cleanup below has published its delete.
+        auto release = wil::scope_exit([&restart]() { restart->Completed.SetEvent(); });
+
+        std::shared_ptr<StateTransition> transition;
+
+        {
+            auto lifecycleLock = m_lifecycleLock.lock_shared();
+            auto lock = m_lock.lock_exclusive();
+
+            // CommitState() clears this once the start phase lands, so a later restart may already own it.
+            if (m_restart == restart)
+            {
+                m_restart.reset();
+            }
+
+            if (!succeeded)
+            {
+                transition = OnFailedRestartExclusiveLockHeld();
+            }
+        }
+
+        if (transition)
+        {
+            AttachToTransition(transition);
+        }
+    });
+
+    if (wasRunning)
+    {
+        StopPhase(Signal, TimeoutSeconds, false, true);
+    }
+
+    StartPhase(WSLCContainerStartFlagsNone, nullptr, true);
+    succeeded = true;
+}
+
+// N.B. Runs with m_restart already cleared, so the delete below is no longer suppressed by OnStopped().
+__requires_exclusive_lock_held(m_lock) std::shared_ptr<WSLCContainerImpl::StateTransition> WSLCContainerImpl::OnFailedRestartExclusiveLockHeld()
+{
+    // The start phase waits for the start event after Docker has accepted the start, so it can throw
+    // on a container that is coming up. Leave that container alone; it still owns its resources.
+    if (m_transition || m_state == WslcContainerStateRunning)
+    {
+        return nullptr;
+    }
+
+    // The stop phase held these back for a start phase that never landed.
+    if (m_runtimeResourcesHeld)
+    {
+        ReleaseRuntimeResources();
+    }
+
+    if (WI_IsFlagClear(m_containerFlags, WSLCContainerFlagsRm) || m_state != WslcContainerStateExited)
+    {
+        return nullptr;
+    }
+
+    // N.B. Requested here rather than through Delete() so the removal shares the scope that clears
+    // m_restart, which is what stops a released Start() from bringing the container back up first.
+    RequestDeleteExclusiveLockHeld(WSLCDeleteFlagsForce | WSLCDeleteFlagsDeleteVolumes);
+    return StartTransition(TransitionKind::Delete, ContainerEvent::Destroy);
+}
+
+__requires_exclusive_lock_held(m_lock) void WSLCContainerImpl::OnStopped(int exitCode, const std::map<std::string, std::string>& attributes, std::int64_t stopTimeNano)
 {
     auto transition = m_transition;
 
-    // A Stop while expecting Start should not occur normally: Docker emits start before die, and the event stream processes
+    // An exit while expecting Start should not occur normally: Docker emits start before die, and the event stream processes
     // them serially. It would indicate external manipulation. Ignoring it avoids applying an old exit code to the newly
     // staged init process.
     if (transition && (transition->ExpectedEvent == ContainerEvent::Start))
@@ -1452,12 +1675,17 @@ __requires_exclusive_lock_held(m_lock) void WSLCContainerImpl::OnStopped(int exi
     }
 
     ReleaseProcesses();
-    ReleaseRuntimeResources();
 
-    // Ignore duplicate or late Stop events so they do not overwrite an already committed state.
+    // A restart's start phase relies on the container's ports and mounts still being held.
+    if (!m_restart)
+    {
+        ReleaseRuntimeResources();
+    }
+
+    // Ignore duplicate or late exit events so they do not overwrite an already committed state.
     if (m_state == WslcContainerStateRunning)
     {
-        CommitState(WslcContainerStateExited, stopTimestamp);
+        CommitState(WslcContainerStateExited, stopTimeNano, attributes);
     }
 
     std::exception_ptr transitionException;
@@ -1469,7 +1697,7 @@ __requires_exclusive_lock_held(m_lock) void WSLCContainerImpl::OnStopped(int exi
     }
 
     // Stop with Rm must initiate Delete.
-    if (WI_IsFlagSet(m_containerFlags, WSLCContainerFlagsRm))
+    if (WI_IsFlagSet(m_containerFlags, WSLCContainerFlagsRm) && !m_restart)
     {
         try
         {
@@ -1543,7 +1771,10 @@ void WSLCContainerImpl::Delete(WSLCDeleteFlags Flags)
     std::shared_ptr<StateTransition> transition;
     auto lifecycleLock = m_lifecycleLock.lock_shared();
     auto lock = m_lock.lock_exclusive();
-    WaitForConflictingTransitionToComplete(lock, lifecycleLock);
+
+    // N.B. Unlike Start() and Stop(), this deliberately does not stand down for an in-flight restart.
+    // A remove that lands between the two phases takes effect, and the restart's start phase fails.
+    WaitForConflictingTransitionToComplete(lock, lifecycleLock, std::nullopt, false);
 
     RequestDeleteExclusiveLockHeld(Flags);
     transition = StartTransition(TransitionKind::Delete, ContainerEvent::Destroy);
@@ -1620,8 +1851,40 @@ void WSLCContainerImpl::Export(WSLCHandle OutHandle) const
     }
 }
 
-void WSLCContainerImpl::UploadArchive(WSLCHandle TarHandle, LPCSTR DestPath, ULONGLONG ContentSize) const
+void WSLCContainerImpl::AcquireArchiveVolumeMounts()
 {
+    auto lock = m_lock.lock_exclusive();
+
+    THROW_HR_WITH_USER_ERROR_IF(WSLC_E_CONTAINER_DELETED, Localization::MessageWslcContainerDeleted(m_id), m_state == WslcContainerStateDeleted);
+
+    if (!m_runtimeResourcesHeld && m_archiveMountUsers == 0)
+    {
+        MountVolumes(m_mountedVolumes, m_runtime.Vm()).release();
+    }
+
+    m_archiveMountUsers++;
+}
+
+void WSLCContainerImpl::ReleaseArchiveVolumeMounts() noexcept
+try
+{
+    auto lock = m_lock.lock_exclusive();
+
+    WI_ASSERT(m_archiveMountUsers > 0);
+    m_archiveMountUsers--;
+
+    if (m_archiveMountUsers == 0 && !m_runtimeResourcesHeld)
+    {
+        UnmountVolumesLockHeld();
+    }
+}
+CATCH_LOG();
+
+void WSLCContainerImpl::UploadArchive(WSLCHandle TarHandle, LPCSTR DestPath, ULONGLONG ContentSize)
+{
+    AcquireArchiveVolumeMounts();
+    auto releaseMounts = wil::scope_exit([this]() { ReleaseArchiveVolumeMounts(); });
+
     auto lock = m_lock.lock_shared();
 
     std::optional<uint64_t> contentLength;
@@ -1682,11 +1945,36 @@ void WSLCContainerImpl::UploadArchive(WSLCHandle TarHandle, LPCSTR DestPath, ULO
     }
 }
 
-void WSLCContainerImpl::DownloadArchive(LPCSTR SrcPath, WSLCHandle OutHandle) const
+void WSLCContainerImpl::DownloadArchive(LPCSTR SrcPath, BOOL FollowLink, WSLCHandle OutHandle)
 {
+    AcquireArchiveVolumeMounts();
+    auto releaseMounts = wil::scope_exit([this]() { ReleaseArchiveVolumeMounts(); });
+
     auto lock = m_lock.lock_shared();
 
-    auto [statusCode, socket, isChunked] = m_runtime.Docker().GetArchive(m_id, SrcPath);
+    std::string effectivePath(SrcPath);
+
+    if (FollowLink)
+    {
+        const auto stat = m_runtime.Docker().StatArchivePath(m_id, effectivePath);
+        if (stat.has_value() && stat->IsSymlink() && !stat->linkTarget.empty())
+        {
+            // Container paths are POSIX. A relative link target is resolved against the directory holding the link.
+            std::string resolved = stat->linkTarget;
+            if (resolved.front() != '/')
+            {
+                const auto separator = effectivePath.find_last_of('/');
+                if (separator != std::string::npos)
+                {
+                    resolved = effectivePath.substr(0, separator + 1) + resolved;
+                }
+            }
+
+            effectivePath = std::move(resolved);
+        }
+    }
+
+    auto [statusCode, socket, isChunked] = m_runtime.Docker().GetArchive(m_id, effectivePath);
 
     auto userHandle = m_wslcSession.OpenUserHandle(OutHandle);
 
@@ -1812,10 +2100,8 @@ void WSLCContainerImpl::Exec(const WSLCProcessOptions* Options, const WSLCProces
 
         // N.B. There's no way to delete a created exec instance, it is removed when the container is deleted.
 
-        wil::unique_handle stream{
-            (HANDLE)m_runtime.Docker()
-                .StartExec(result.Id, common::docker_schema::StartExec{.Tty = request.Tty, .ConsoleSize = request.ConsoleSize})
-                .release()};
+        auto stream = m_runtime.Docker().StartExec(
+            result.Id, common::docker_schema::StartExec{.Tty = request.Tty, .ConsoleSize = request.ConsoleSize});
 
         std::unique_ptr<WSLCProcessIO> io;
         if (request.Tty)
@@ -1824,7 +2110,7 @@ void WSLCContainerImpl::Exec(const WSLCProcessOptions* Options, const WSLCProces
         }
         else
         {
-            io = CreateRelayedProcessIO(std::move(stream), Options->Flags);
+            io = CreateRelayedProcessIO(wil::shared_socket{std::move(stream)}, Options->Flags);
         }
 
         auto control = std::make_shared<DockerExecProcessControl>(*this, result.Id, m_runtime.Docker(), m_runtime.Events());
@@ -1889,9 +2175,11 @@ WslcInspectContainer WSLCContainerImpl::BuildInspectContainer(const DockerInspec
     WslcInspectContainer wslcInspect{};
 
     wslcInspect.Id = dockerInspect.Id;
-    wslcInspect.Name = CleanContainerName(dockerInspect.Name);
+    wslcInspect.Name = dockerInspect.Name;
     wslcInspect.Created = dockerInspect.Created;
-    wslcInspect.Image = m_image;
+    wslcInspect.Image = dockerInspect.Image;
+    wslcInspect.SizeRw = dockerInspect.SizeRw;
+    wslcInspect.SizeRootFs = dockerInspect.SizeRootFs;
 
     // Map container state.
     wslcInspect.State.Status = dockerInspect.State.Status;
@@ -1929,6 +2217,9 @@ WslcInspectContainer WSLCContainerImpl::BuildInspectContainer(const DockerInspec
             wslcInspect.HostConfig.Ulimits.push_back({ulimit.Name, ulimit.Soft, ulimit.Hard});
         }
     }
+
+    wslcInspect.HostConfig.CapAdd = dockerInspect.HostConfig.CapAdd.value_or(std::vector<std::string>{});
+    wslcInspect.HostConfig.CapDrop = dockerInspect.HostConfig.CapDrop.value_or(std::vector<std::string>{});
 
     wslcInspect.Config.Image = m_image;
     wslcInspect.Config.Env = dockerInspect.Config.Env;
@@ -2080,11 +2371,11 @@ std::shared_ptr<WSLCContainerImpl> WSLCContainerImpl::Create(
     WSLCSessionRuntime& runtime,
     IWSLCPluginNotifier* pluginNotifier,
     const std::unordered_map<std::string, NetworkEntry>& sessionNetworks,
-    std::function<void(const WSLCContainerImpl*)>&& OnDeleted)
+    std::function<void(const WSLCContainerImpl*)>&& OnDeleted,
+    EventStore& eventStore)
 {
     auto& virtualMachine = runtime.Vm();
     auto& DockerClient = runtime.Docker();
-    auto& EventTracker = runtime.Events();
     const auto mounts = ConvertAndValidateMounts(containerOptions);
 
     common::docker_schema::CreateContainer request;
@@ -2173,6 +2464,16 @@ std::shared_ptr<WSLCContainerImpl> WSLCContainerImpl::Create(
             containerOptions.DnsOptions.Count);
 
         request.HostConfig.DnsOptions = StringArrayToVector(containerOptions.DnsOptions);
+    }
+
+    if (containerOptions.CapAdd.Count > 0)
+    {
+        request.HostConfig.CapAdd = StringArrayToVector(containerOptions.CapAdd);
+    }
+
+    if (containerOptions.CapDrop.Count > 0)
+    {
+        request.HostConfig.CapDrop = StringArrayToVector(containerOptions.CapDrop);
     }
 
     if (containerOptions.InitProcessOptions.User != nullptr)
@@ -2282,6 +2583,12 @@ std::shared_ptr<WSLCContainerImpl> WSLCContainerImpl::Create(
 
     for (const auto& mount : mounts)
     {
+        if (mount.ConfigVolume)
+        {
+            request.Volumes[mount.Target] = {};
+            continue;
+        }
+
         common::docker_schema::Mount dockerMount{
             .Target = mount.Target,
             .ReadOnly = mount.ReadOnly,
@@ -2289,7 +2596,7 @@ std::shared_ptr<WSLCContainerImpl> WSLCContainerImpl::Create(
 
         switch (mount.MountType)
         {
-        case wsl::windows::common::mount::Type::Bind:
+        case WSLCMountTypeBind:
         {
             // Docker's colon-delimited bind format cannot represent ':' in the target.
             const auto missingSource = mount.BindSource == wsl::windows::common::mount::BindSourcePolicy::CreateIfMissing
@@ -2302,12 +2609,12 @@ std::shared_ptr<WSLCContainerImpl> WSLCContainerImpl::Create(
             break;
         }
 
-        case wsl::windows::common::mount::Type::Volume:
+        case WSLCMountTypeVolume:
             dockerMount.Source = wsl::shared::string::WideToMultiByte(mount.Source);
             dockerMount.Type = "volume";
             break;
 
-        case wsl::windows::common::mount::Type::Tmpfs:
+        case WSLCMountTypeTmpfs:
             if (mount.TmpfsOptions.has_value())
             {
                 request.HostConfig.Tmpfs[mount.Target] = mount.TmpfsOptions.value();
@@ -2457,6 +2764,7 @@ std::shared_ptr<WSLCContainerImpl> WSLCContainerImpl::Create(
     WSLCContainerMetadataV1 metadata;
     metadata.Flags = containerOptions.Flags;
     metadata.InitProcessFlags = containerOptions.InitProcessOptions.Flags;
+    metadata.Image = containerOptions.Image;
     metadata.Volumes = volumes;
 
     for (const auto& e : mappedPorts)
@@ -2470,7 +2778,7 @@ std::shared_ptr<WSLCContainerImpl> WSLCContainerImpl::Create(
     // Docker validates structured bind sources during container creation, so their VM paths must exist here.
     // Release the temporary shares before returning; Start remounts them for the container lifetime.
     auto result = [&]() {
-        auto volumeCleanup = MountVolumesWithUserError(volumes, virtualMachine);
+        auto volumeCleanup = MountVolumes(volumes, virtualMachine);
         return DockerClient.CreateContainer(request, containerName);
     }();
 
@@ -2518,11 +2826,6 @@ std::shared_ptr<WSLCContainerImpl> WSLCContainerImpl::Create(
             name.c_str());
     }
 
-    // Wait for the container create event to be delivered on the Docker event stream so that
-    // any events for objects created for the container (e.g. volumes) are delivered before we return
-    // from this function.
-    EventTracker.WaitForObjectCreated(result.Id);
-
     // Collect the names of referenced docker named volumes so Start() can verify
     // they are available before running the container.
     std::vector<std::string> namedVolumes;
@@ -2534,13 +2837,14 @@ std::shared_ptr<WSLCContainerImpl> WSLCContainerImpl::Create(
 
     for (const auto& mount : mounts)
     {
-        if (mount.MountType == wsl::windows::common::mount::Type::Volume && !mount.Source.empty())
+        if (mount.MountType == WSLCMountTypeVolume && !mount.Source.empty())
         {
             namedVolumes.emplace_back(wsl::shared::string::WideToMultiByte(mount.Source));
         }
     }
 
     auto mergedLabels = StripInternalLabels(std::move(inspectData.Config.Labels));
+    const auto createdAt = wsl::windows::common::timestamp::Rfc3339ToEpoch(inspectData.Created);
 
     auto container = std::make_shared<WSLCContainerImpl>(
         wslcSession,
@@ -2555,8 +2859,9 @@ std::shared_ptr<WSLCContainerImpl> WSLCContainerImpl::Create(
         std::move(mappedPorts),
         std::move(mergedLabels),
         std::move(OnDeleted),
+        eventStore,
         WslcContainerStateCreated,
-        wsl::windows::common::timestamp::Rfc3339ToEpoch(inspectData.Created),
+        createdAt,
         containerOptions.InitProcessOptions.Flags,
         containerOptions.Flags);
 
@@ -2571,7 +2876,8 @@ std::shared_ptr<WSLCContainerImpl> WSLCContainerImpl::Open(
     WSLCSession& wslcSession,
     WSLCSessionRuntime& runtime,
     IWSLCPluginNotifier* pluginNotifier,
-    std::function<void(const WSLCContainerImpl*)>&& OnDeleted)
+    std::function<void(const WSLCContainerImpl*)>&& OnDeleted,
+    EventStore& eventStore)
 {
     auto& virtualMachine = runtime.Vm();
     auto& DockerClient = runtime.Docker();
@@ -2630,19 +2936,23 @@ std::shared_ptr<WSLCContainerImpl> WSLCContainerImpl::Open(
         }
     }
 
+    // Containers created before the image was persisted fall back to what Docker reports.
+    std::string image = metadata.Image.empty() ? dockerContainer.Image : std::move(metadata.Image);
+
     auto container = std::make_shared<WSLCContainerImpl>(
         wslcSession,
         runtime,
         pluginNotifier,
         std::string(dockerContainer.Id),
         std::move(name),
-        std::string(dockerContainer.Image),
+        std::move(image),
         std::move(networkMode),
         std::move(metadata.Volumes),
         std::move(namedVolumes),
         std::move(ports),
         std::move(labels),
         std::move(OnDeleted),
+        eventStore,
         DockerStateToWSLCState(dockerContainer.State),
         dockerContainer.Created,
         metadata.InitProcessFlags,
@@ -2687,21 +2997,21 @@ const std::string& WSLCContainerImpl::ID() const noexcept
     return m_id;
 }
 
-void WSLCContainerImpl::Inspect(LPSTR* Output) const
+void WSLCContainerImpl::Inspect(BOOL Size, LPSTR* Output) const
 {
     auto lock = m_lock.lock_shared();
 
     try
     {
-        *Output = wil::make_unique_ansistring<wil::unique_cotaskmem_ansistring>(InspectLockHeld().c_str()).release();
+        *Output = wil::make_unique_ansistring<wil::unique_cotaskmem_ansistring>(InspectLockHeld(!!Size).c_str()).release();
     }
     CATCH_AND_THROW_DOCKER_USER_ERROR("Failed to inspect container '%hs'", m_id.c_str());
 }
 
-std::string WSLCContainerImpl::InspectLockHeld() const
+std::string WSLCContainerImpl::InspectLockHeld(bool Size) const
 {
     // Get Docker inspect data
-    auto dockerInspect = m_runtime.Docker().InspectContainer(m_id);
+    auto dockerInspect = m_runtime.Docker().InspectContainer(m_id, Size);
 
     // Convert to WSLC schema
     auto wslcInspect = BuildInspectContainer(dockerInspect);
@@ -2766,22 +3076,20 @@ void WSLCContainerImpl::Stats(LPSTR* Output) const
     CATCH_AND_THROW_DOCKER_USER_ERROR("Failed to get stats for container '%hs'", m_id.c_str());
 }
 
-std::unique_ptr<RelayedProcessIO> WSLCContainerImpl::CreateRelayedProcessIO(wil::unique_handle&& stream, WSLCProcessFlags flags)
+std::unique_ptr<RelayedProcessIO> WSLCContainerImpl::CreateRelayedProcessIO(wil::shared_socket stream, WSLCProcessFlags flags)
 {
     // Create one pipe for each STD handle.
     std::vector<std::unique_ptr<OverlappedIOHandle>> ioHandles;
     std::map<ULONG, TypedHandle> fds;
 
     // This is required for docker to know when stdin is closed.
-    auto closeStdin = [socket = stream.get(), this]() {
-        LOG_LAST_ERROR_IF(shutdown(reinterpret_cast<SOCKET>(socket), SD_SEND) == SOCKET_ERROR);
-    };
+    auto closeStdin = [stream]() { LOG_LAST_ERROR_IF(shutdown(stream.get(), SD_SEND) == SOCKET_ERROR); };
 
     if (WI_IsFlagSet(flags, WSLCProcessFlagsStdin))
     {
         auto [stdinRead, stdinWrite] = common::wslutil::OpenAnonymousPipe(LX_RELAY_BUFFER_SIZE, true, true);
-        ioHandles.emplace_back(
-            std::make_unique<RelayHandle<ReadHandle>>(HandleWrapper{std::move(stdinRead), std::move(closeStdin)}, stream.get()));
+        ioHandles.emplace_back(std::make_unique<RelayHandle<ReadHandle>>(
+            HandleWrapper{std::move(stdinRead), std::move(closeStdin)}, HandleWrapper{stream}));
 
         fds.emplace(WSLCFDStdin, TypedHandle{wil::unique_handle{stdinWrite.release()}, WSLCHandleTypePipe});
     }
@@ -2798,7 +3106,7 @@ std::unique_ptr<RelayedProcessIO> WSLCContainerImpl::CreateRelayedProcessIO(wil:
     fds.emplace(WSLCFDStderr, TypedHandle{wil::unique_handle{stderrRead.release()}, WSLCHandleTypePipe});
 
     ioHandles.emplace_back(std::make_unique<DockerIORelayHandle>(
-        std::move(stream), std::move(stdoutWrite), std::move(stderrWrite), common::io::DockerIORelayHandle::Format::Raw));
+        HandleWrapper{stream}, std::move(stdoutWrite), std::move(stderrWrite), common::io::DockerIORelayHandle::Format::Raw));
 
     m_runtime.Relay()->AddHandles(std::move(ioHandles));
 
@@ -2898,9 +3206,20 @@ __requires_exclusive_lock_held(m_lock) void WSLCContainerImpl::ReleaseRuntimeRes
 {
     WSL_LOG("ReleaseRuntimeResources", TraceLoggingValue(m_id.c_str(), "ID"));
 
+    m_runtimeResourcesHeld = false;
+
     // Release runtime resources (port relays, volume mounts) that were set up at Start().
     UnmapPorts();
 
+    // An in-flight archive operation still needs the mounts and unmounts them once it completes.
+    if (m_archiveMountUsers == 0)
+    {
+        UnmountVolumesLockHeld();
+    }
+}
+
+__requires_exclusive_lock_held(m_lock) void WSLCContainerImpl::UnmountVolumesLockHeld()
+{
     // A VM that already exited (crash / external kill) has dropped every guest mount, so calling
     // UnmountWindowsFolder would only block on the RPC timeout and emit spurious unmount-failed
     // warnings. Mark the mounts inactive without touching the dead VM.
@@ -2938,20 +3257,11 @@ __requires_exclusive_lock_held(m_lock) unique_com_disconnect WSLCContainerImpl::
 
 __requires_exclusive_lock_held(m_lock) unique_com_disconnect WSLCContainerImpl::PrepareDisconnectComWrapper()
 {
-    if (m_comWrapper)
-    {
-        // Cache read-only properties in the COM wrapper before disconnecting,
-        // so callers can still query state/process after the impl is gone.
-        {
-            std::lock_guard processesLock{m_processesLock};
-            m_comWrapper->CacheState(m_id, m_name, m_state, m_initProcess);
-        }
-    }
-
     return unique_com_disconnect{std::exchange(m_comWrapper, nullptr)};
 }
 
-__requires_lock_held(m_lock) void WSLCContainerImpl::CommitState(WSLCContainerState State, std::optional<std::int64_t> stateChangedAt) noexcept
+__requires_lock_held(m_lock) void WSLCContainerImpl::CommitState(
+    WSLCContainerState State, std::int64_t TimeNano, const std::map<std::string, std::string>& DockerAttributes) noexcept
 {
     // N.B. A deleted container cannot transition back to any other state.
     WI_ASSERT(m_state != WslcContainerStateDeleted);
@@ -2964,13 +3274,33 @@ __requires_lock_held(m_lock) void WSLCContainerImpl::CommitState(WSLCContainerSt
 
     m_state = State;
     m_stateGeneration++;
-    m_stateChangedAt = stateChangedAt.value_or(static_cast<std::int64_t>(std::time(nullptr)));
+    m_stateChangedAt = std::chrono::floor<std::chrono::seconds>(std::chrono::nanoseconds{TimeNano}).count();
+
+    RecordEvent(WSLCStateToEventAction(State), TimeNano, DockerAttributes);
+
+    // A held 'stop' takes the exit's time so it stays in timestamp order, and never outlives the run it belongs to.
+    if (auto pendingStop = std::exchange(m_pendingStopAttributes, std::nullopt); pendingStop.has_value() && State == WslcContainerStateExited)
+    {
+        RecordEvent("stop", TimeNano, pendingStop.value());
+    }
+
+    if (State == WslcContainerStateRunning)
+    {
+        // The restart's start phase landed, so a later exit must auto-delete an --rm container again.
+        m_restart.reset();
+    }
 
     // Keep the VM alive while this container is Running and release the hold once it leaves that
     // state, even when no client holds the wrapper (e.g. a detached `run -d` container). Dropping
     // the hold on the transition out of Running is what lets an otherwise-idle VM be torn down; a
     // Created or Exited container does not pin the VM, since its metadata survives teardown.
     UpdateActivityHoldLockHeld();
+
+    if (m_comWrapper)
+    {
+        std::lock_guard processesLock{m_processesLock};
+        m_comWrapper->CacheState(m_state, m_initProcess);
+    }
 }
 
 __requires_lock_held(m_lock) void WSLCContainerImpl::UpdateActivityHoldLockHeld() noexcept
@@ -2986,16 +3316,26 @@ __requires_lock_held(m_lock) void WSLCContainerImpl::UpdateActivityHoldLockHeld(
     }
 }
 
-WSLCContainer::WSLCContainer(WSLCSession& session, std::function<void(const WSLCContainerImpl*)>&& OnDeleted) :
-    m_session(session), m_onDeleted(std::move(OnDeleted))
+WSLCContainer::WSLCContainer(
+    WSLCSession& session, const std::string& id, const std::string& name, WSLCContainerState state, std::function<void(const WSLCContainerImpl*)>&& OnDeleted) :
+    m_session(session), m_onDeleted(std::move(OnDeleted)), m_cachedId(id), m_cachedName(name), m_cachedState(state)
 {
+    Microsoft::WRL::ComPtr<IWeakReferenceSource> weakRefSource;
+    THROW_IF_FAILED(session.QueryInterface(IID_PPV_ARGS(&weakRefSource)));
+    THROW_IF_FAILED(weakRefSource->GetWeakReference(&m_weakSession));
+}
+
+Microsoft::WRL::ComPtr<IWSLCSession> WSLCContainer::ResolveSession(bool Required) const
+{
+    Microsoft::WRL::ComPtr<IWSLCSession> session;
+    THROW_IF_FAILED(m_weakSession->Resolve(__uuidof(IWSLCSession), reinterpret_cast<IInspectable**>(session.GetAddressOf())));
+    THROW_HR_IF(RPC_E_DISCONNECTED, Required && !session);
+    return session;
 }
 
 HRESULT WSLCContainer::Attach(LPCSTR DetachKeys, WSLCHandle* Stdin, WSLCHandle* Stdout, WSLCHandle* Stderr)
 try
 {
-    WSLCExecutionContext context(&m_session);
-
     RETURN_HR_IF_NULL(E_POINTER, Stdin);
     RETURN_HR_IF_NULL(E_POINTER, Stdout);
     RETURN_HR_IF_NULL(E_POINTER, Stderr);
@@ -3004,54 +3344,52 @@ try
     *Stdout = {};
     *Stderr = {};
 
+    auto sessionLifetime = ResolveSession();
+    WSLCExecutionContext context(&m_session);
     auto vmLease = m_session.Runtime().AcquireVmLease();
     return CallImpl(&WSLCContainerImpl::Attach, DetachKeys, Stdin, Stdout, Stderr);
 }
 CATCH_RETURN();
 
 HRESULT WSLCContainer::GetState(WSLCContainerState* Result)
+try
 {
-    WSLCExecutionContext context(&m_session);
     RETURN_HR_IF_NULL(E_POINTER, Result);
-
     *Result = WslcContainerStateInvalid;
-    HRESULT hr = CallImpl(&WSLCContainerImpl::GetState, Result);
+
+    auto sessionLifetime = ResolveSession(false);
+    WSLCExecutionContext context(sessionLifetime ? &m_session : nullptr);
+    HRESULT hr = sessionLifetime ? CallImpl(&WSLCContainerImpl::GetState, Result) : RPC_E_DISCONNECTED;
     if (SUCCEEDED(hr))
     {
         return S_OK;
     }
 
-    // PrepareDisconnectComWrapper() populates the cache before setting m_impl to null,
-    // so if CallImpl failed with RPC_E_DISCONNECTED, the cache must be populated.
     if (hr == RPC_E_DISCONNECTED)
     {
         auto cacheLock = m_cacheLock.lock_shared();
-        if (WI_VERIFY(m_cachedState.has_value()))
-        {
-            *Result = m_cachedState.value();
-            return S_OK;
-        }
+        *Result = m_cachedState;
+        return S_OK;
     }
 
     return hr;
 }
+CATCH_RETURN();
 
 HRESULT WSLCContainer::GetInitProcess(IWSLCProcess** Process)
+try
 {
-    WSLCExecutionContext context(&m_session);
-
     RETURN_HR_IF_NULL(E_POINTER, Process);
-
     *Process = nullptr;
 
-    HRESULT hr = CallImpl(&WSLCContainerImpl::GetInitProcess, Process);
+    auto sessionLifetime = ResolveSession(false);
+    WSLCExecutionContext context(sessionLifetime ? &m_session : nullptr);
+    HRESULT hr = sessionLifetime ? CallImpl(&WSLCContainerImpl::GetInitProcess, Process) : RPC_E_DISCONNECTED;
     if (SUCCEEDED(hr))
     {
         return S_OK;
     }
 
-    // PrepareDisconnectComWrapper() populates the cache before setting m_impl to null,
-    // so if CallImpl failed with RPC_E_DISCONNECTED, the cache must be populated.
     if (hr == RPC_E_DISCONNECTED)
     {
         auto cacheLock = m_cacheLock.lock_shared();
@@ -3063,17 +3401,18 @@ HRESULT WSLCContainer::GetInitProcess(IWSLCProcess** Process)
 
     return hr;
 }
+CATCH_RETURN();
 
 HRESULT WSLCContainer::Exec(const WSLCProcessOptions* Options, const WSLCProcessStartOptions* StartOptions, IWSLCProcess** Process)
 try
 {
-    WSLCExecutionContext context(&m_session);
-
     RETURN_HR_IF_NULL(E_POINTER, Options);
     RETURN_HR_IF_NULL(E_POINTER, Process);
-    RETURN_HR_IF_MSG(E_INVALIDARG, WI_IsAnyFlagSet(Options->Flags, ~WSLCProcessFlagsValid), "Invalid flags: 0x%x", Options->Flags);
-
     *Process = nullptr;
+
+    auto sessionLifetime = ResolveSession();
+    WSLCExecutionContext context(&m_session);
+    RETURN_HR_IF_MSG(E_INVALIDARG, WI_IsAnyFlagSet(Options->Flags, ~WSLCProcessFlagsValid), "Invalid flags: 0x%x", Options->Flags);
 
     auto vmLease = m_session.Runtime().AcquireVmLease();
     return CallImpl(&WSLCContainerImpl::Exec, Options, StartOptions, Process);
@@ -3083,6 +3422,7 @@ CATCH_RETURN();
 HRESULT WSLCContainer::Stop(_In_ WSLCSignal Signal, _In_ LONG TimeoutSeconds)
 try
 {
+    auto sessionLifetime = ResolveSession();
     WSLCExecutionContext context(&m_session);
 
     // Hold a VM lease for the whole operation: --rm containers self-delete during Stop, which
@@ -3096,6 +3436,7 @@ CATCH_RETURN();
 HRESULT WSLCContainer::Kill(_In_ WSLCSignal Signal)
 try
 {
+    auto sessionLifetime = ResolveSession();
     WSLCExecutionContext context(&m_session);
 
     // Hold a VM lease for the same reason as Stop(): --rm can self-delete and drop activity.
@@ -3104,9 +3445,23 @@ try
 }
 CATCH_RETURN();
 
+HRESULT WSLCContainer::Restart(_In_ WSLCSignal Signal, _In_ LONG TimeoutSeconds, IWarningCallback* WarningCallback)
+try
+{
+    auto sessionLifetime = ResolveSession();
+    WSLCExecutionContext context(&m_session, WarningCallback);
+
+    // Hold a VM lease across both phases: the container is not Running in between, so nothing else
+    // keeps the VM alive.
+    auto vmLease = m_session.Runtime().AcquireVmLease();
+    return CallImpl(&WSLCContainerImpl::Restart, Signal, TimeoutSeconds);
+}
+CATCH_RETURN();
+
 HRESULT WSLCContainer::Start(WSLCContainerStartFlags Flags, const WSLCProcessStartOptions* StartOptions, IWarningCallback* WarningCallback)
 try
 {
+    auto sessionLifetime = ResolveSession();
     WSLCExecutionContext context(&m_session, WarningCallback);
 
     THROW_HR_IF_MSG(E_INVALIDARG, WI_IsAnyFlagSet(Flags, ~WSLCContainerStartFlagsValid), "Invalid flags: 0x%x", Flags);
@@ -3116,29 +3471,27 @@ try
 }
 CATCH_RETURN();
 
-HRESULT WSLCContainer::Inspect(LPSTR* Output)
+HRESULT WSLCContainer::Inspect(BOOL Size, LPSTR* Output)
 try
 {
-    WSLCExecutionContext context(&m_session);
-
     RETURN_HR_IF_NULL(E_POINTER, Output);
-
     *Output = nullptr;
 
+    auto sessionLifetime = ResolveSession();
+    WSLCExecutionContext context(&m_session);
     auto vmLease = m_session.Runtime().AcquireVmLease();
-    return CallImpl(&WSLCContainerImpl::Inspect, Output);
+    return CallImpl(&WSLCContainerImpl::Inspect, Size, Output);
 }
 CATCH_RETURN();
 
 HRESULT WSLCContainer::Stats(LPSTR* Output)
 try
 {
-    WSLCExecutionContext context(&m_session);
-
     RETURN_HR_IF(E_POINTER, Output == nullptr);
-
     *Output = nullptr;
 
+    auto sessionLifetime = ResolveSession();
+    WSLCExecutionContext context(&m_session);
     auto vmLease = m_session.Runtime().AcquireVmLease();
     return CallImpl(&WSLCContainerImpl::Stats, Output);
 }
@@ -3147,6 +3500,7 @@ CATCH_RETURN();
 HRESULT WSLCContainer::Delete(WSLCDeleteFlags Flags)
 try
 {
+    auto sessionLifetime = ResolveSession();
     WSLCExecutionContext context(&m_session);
 
     THROW_HR_IF_MSG(E_INVALIDARG, WI_IsAnyFlagSet(Flags, ~WSLCDeleteFlagsValid), "Invalid flags: 0x%x", Flags);
@@ -3166,24 +3520,18 @@ try
 }
 CATCH_RETURN();
 
-void WSLCContainer::CacheState(const std::string& id, const std::string& name, WSLCContainerState state, const Microsoft::WRL::ComPtr<IWSLCProcess>& initProcess) noexcept
-try
+void WSLCContainer::CacheState(WSLCContainerState state, const Microsoft::WRL::ComPtr<IWSLCProcess>& initProcess) noexcept
 {
     auto cacheLock = m_cacheLock.lock_exclusive();
 
-    // CacheState must only be called once, during PrepareDisconnectComWrapper().
-    WI_ASSERT(!m_cachedState.has_value());
-
-    m_cachedId = id;
-    m_cachedName = name;
     m_cachedState = state;
     m_cachedInitProcess = initProcess;
 }
-CATCH_LOG();
 
 HRESULT WSLCContainer::Export(WSLCHandle TarHandle)
 try
 {
+    auto sessionLifetime = ResolveSession();
     WSLCExecutionContext context(&m_session);
 
     auto vmLease = m_session.Runtime().AcquireVmLease();
@@ -3194,6 +3542,7 @@ CATCH_RETURN();
 HRESULT WSLCContainer::UploadArchive(WSLCHandle TarHandle, LPCSTR DestPath, ULONGLONG ContentSize)
 try
 {
+    auto sessionLifetime = ResolveSession();
     WSLCExecutionContext context(&m_session);
 
     RETURN_HR_IF(E_POINTER, DestPath == nullptr);
@@ -3204,29 +3553,31 @@ try
 }
 CATCH_RETURN();
 
-HRESULT WSLCContainer::DownloadArchive(LPCSTR SrcPath, WSLCHandle OutHandle)
+HRESULT WSLCContainer::DownloadArchive(LPCSTR SrcPath, BOOL FollowLink, WSLCHandle OutHandle)
 try
 {
+    auto sessionLifetime = ResolveSession();
     WSLCExecutionContext context(&m_session);
 
     RETURN_HR_IF(E_POINTER, SrcPath == nullptr);
     RETURN_HR_IF(E_INVALIDARG, SrcPath[0] == '\0');
 
     auto vmLease = m_session.Runtime().AcquireVmLease();
-    return CallImpl(&WSLCContainerImpl::DownloadArchive, SrcPath, OutHandle);
+    return CallImpl(&WSLCContainerImpl::DownloadArchive, SrcPath, FollowLink, OutHandle);
 }
 CATCH_RETURN();
 
 HRESULT WSLCContainer::Logs(WSLCLogsFlags Flags, WSLCHandle* Stdout, WSLCHandle* Stderr, LONGLONG Since, LONGLONG Until, ULONGLONG Tail)
 try
 {
-    WSLCExecutionContext context(&m_session);
     RETURN_HR_IF(E_POINTER, Stdout == nullptr || Stderr == nullptr);
-
-    THROW_HR_IF_MSG(E_INVALIDARG, WI_IsAnyFlagSet(Flags, ~WSLCLogsFlagsValid), "Invalid flags: 0x%x", Flags);
 
     *Stdout = {};
     *Stderr = {};
+
+    auto sessionLifetime = ResolveSession();
+    WSLCExecutionContext context(&m_session);
+    THROW_HR_IF_MSG(E_INVALIDARG, WI_IsAnyFlagSet(Flags, ~WSLCLogsFlagsValid), "Invalid flags: 0x%x", Flags);
 
     auto vmLease = m_session.Runtime().AcquireVmLease();
     return CallImpl(&WSLCContainerImpl::Logs, Flags, Stdout, Stderr, Since, Until, Tail);
@@ -3236,55 +3587,43 @@ CATCH_RETURN();
 HRESULT WSLCContainer::GetId(WSLCContainerId Id)
 try
 {
-    WSLCExecutionContext context(&m_session);
-
     RETURN_HR_IF_NULL(E_POINTER, Id);
 
+    auto sessionLifetime = ResolveSession(false);
+    WSLCExecutionContext context(sessionLifetime ? &m_session : nullptr);
+
     const auto hr = wil::ResultFromException([&] {
+        THROW_HR_IF(RPC_E_DISCONNECTED, !sessionLifetime);
         auto [lock, impl] = LockImpl();
         WI_VERIFY(strcpy_s(Id, std::size<char>(WSLCContainerId{}), impl->ID().c_str()) == 0);
     });
 
     RETURN_HR_IF(hr, hr != RPC_E_DISCONNECTED);
 
-    // PrepareDisconnectComWrapper() populates the cache before setting m_impl to null,
-    // so if LockImpl failed with RPC_E_DISCONNECTED, the cache must be populated.
-    auto cacheLock = m_cacheLock.lock_shared();
-    if (WI_VERIFY(m_cachedId.has_value()))
-    {
-        WI_VERIFY(strcpy_s(Id, std::size<char>(WSLCContainerId{}), m_cachedId->c_str()) == 0);
-        return S_OK;
-    }
-
-    return hr;
+    WI_VERIFY(strcpy_s(Id, std::size<char>(WSLCContainerId{}), m_cachedId.c_str()) == 0);
+    return S_OK;
 }
 CATCH_RETURN();
 
 HRESULT WSLCContainer::GetName(LPSTR* Name)
 try
 {
-    WSLCExecutionContext context(&m_session);
-
     RETURN_HR_IF_NULL(E_POINTER, Name);
     *Name = nullptr;
 
+    auto sessionLifetime = ResolveSession(false);
+    WSLCExecutionContext context(sessionLifetime ? &m_session : nullptr);
+
     const auto hr = wil::ResultFromException([&] {
+        THROW_HR_IF(RPC_E_DISCONNECTED, !sessionLifetime);
         auto [lock, impl] = LockImpl();
         *Name = wil::make_unique_ansistring<wil::unique_cotaskmem_ansistring>(impl->Name().c_str()).release();
     });
 
     RETURN_HR_IF(hr, hr != RPC_E_DISCONNECTED);
 
-    // PrepareDisconnectComWrapper() populates the cache before setting m_impl to null,
-    // so if LockImpl failed with RPC_E_DISCONNECTED, the cache must be populated.
-    auto cacheLock = m_cacheLock.lock_shared();
-    if (WI_VERIFY(m_cachedName.has_value()))
-    {
-        *Name = wil::make_unique_ansistring<wil::unique_cotaskmem_ansistring>(m_cachedName->c_str()).release();
-        return S_OK;
-    }
-
-    return hr;
+    *Name = wil::make_unique_ansistring<wil::unique_cotaskmem_ansistring>(m_cachedName.c_str()).release();
+    return S_OK;
 }
 CATCH_RETURN();
 
@@ -3390,12 +3729,13 @@ void WSLCContainerImpl::DisconnectFromNetwork(LPCSTR NetworkName)
 HRESULT WSLCContainer::GetLabels(WSLCLabelInformation** Labels, ULONG* Count)
 try
 {
-    WSLCExecutionContext context(&m_session);
-
     RETURN_HR_IF(E_POINTER, Labels == nullptr || Count == nullptr);
 
     *Count = 0;
     *Labels = nullptr;
+
+    auto sessionLifetime = ResolveSession();
+    WSLCExecutionContext context(&m_session);
     return CallImpl(&WSLCContainerImpl::GetLabels, Labels, Count);
 }
 CATCH_RETURN();
@@ -3403,6 +3743,7 @@ CATCH_RETURN();
 HRESULT WSLCContainer::ConnectToNetwork(const WSLCNetworkConnectionOptions* Options)
 try
 {
+    auto sessionLifetime = ResolveSession();
     COMServiceExecutionContext context;
 
     auto vmLease = m_session.Runtime().AcquireVmLease();
@@ -3413,6 +3754,7 @@ CATCH_RETURN();
 HRESULT WSLCContainer::DisconnectFromNetwork(LPCSTR NetworkName)
 try
 {
+    auto sessionLifetime = ResolveSession();
     COMServiceExecutionContext context;
 
     auto vmLease = m_session.Runtime().AcquireVmLease();
@@ -3458,5 +3800,12 @@ try
     RETURN_HR_IF_NULL(E_UNEXPECTED, process);
 
     return process.CopyTo(Process);
+}
+CATCH_RETURN();
+
+HRESULT WSLCContainer::Inspect(LPSTR* Output)
+try
+{
+    return Inspect(FALSE, Output);
 }
 CATCH_RETURN();
